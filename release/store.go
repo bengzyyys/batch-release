@@ -28,6 +28,7 @@ type Store struct {
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
 // 已有台账文件无法读取、解析，任一批次绑定的配方版本未登记，
+// 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
 // 超过 9223372036854775.807 克）时，返回 ErrCorruptData（可用 errors.Is
 // 判断），不会当成空台账继续保存，也不会返回可继续使用的台账对象。
@@ -134,28 +135,45 @@ func (s *Store) load() error {
 //     不得超过 maxGramsMilli（9223372036854775.807 克）。任一记录为零或
 //     负数，或任一物料累计超限，整份台账即视为损坏——负数记录即使能被
 //     正数抵消回范围内也不接受，超限也不能截断或忽略后继续。
+//   - 每条已保存投料的物料编号必须属于该批次绑定的配方版本。归属以批次
+//     实际绑定的版本为准：物料只出现在同编号的其他版本或其他配方中，
+//     不能作为接受依据；也不能改选版本、补入物料或丢弃问题投料后继续。
 func validateState(st *persistedState) error {
 	for _, b := range st.Batches {
 		if b == nil {
 			return fmt.Errorf("%w: 台账中存在空的批次记录", ErrCorruptData)
 		}
-		if findRecipe(st, b.RecipeNo, b.RecipeVersion) == nil {
+		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		if r == nil {
 			return fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
 				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
 		}
-		if err := validateFeedings(b); err != nil {
+		if err := validateFeedings(b, r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// validateFeedings 检查一个批次内已保存投料的数量合法性。
-// 只判断数量本身是否合法，不判断实投是否符合配方：无投料的物料
-// 累计为零属正常，不足或超过应投量也不在此拒绝。
-func validateFeedings(b *batchRecord) error {
+// validateFeedings 检查一个批次内已保存投料的合法性与配方归属。
+// 归属以批次绑定的配方版本 r 为准：每条投料的物料编号必须在 r 的物料
+// 列表中，否则整份台账视为损坏。数量方面只判断数量本身是否合法，不判断
+// 实投是否符合配方：无投料的物料累计为零属正常，不足或超过应投量也不
+// 在此拒绝。
+func validateFeedings(b *batchRecord, r *recipeRecord) error {
 	sums := map[string]gramsMilli{}
 	for _, f := range b.Feedings {
+		belongs := false
+		for _, m := range r.Materials {
+			if m.MaterialNo == f.MaterialNo {
+				belongs = true
+				break
+			}
+		}
+		if !belongs {
+			return fmt.Errorf("%w: 批次 %q 的第 %d 条投料物料 %q 不属于其绑定的配方 %q 版本 %q",
+				ErrCorruptData, b.BatchNo, f.Seq, f.MaterialNo, b.RecipeNo, b.RecipeVersion)
+		}
 		if f.GramsMilli <= 0 {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的第 %d 条投料数量不是正数",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, f.Seq)
