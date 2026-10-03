@@ -27,7 +27,8 @@ type Store struct {
 
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
-// 已有台账文件无法读取、解析，任一配方版本的任一物料每份克数不是正数，
+// 已有台账文件无法读取、解析，任一配方版本的物料编号重复，
+// 任一配方版本的任一物料每份克数不是正数，
 // 任一批次绑定的配方版本未登记，
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
@@ -129,6 +130,10 @@ func (s *Store) load() error {
 }
 
 // validateState 检查台账的引用完整性与数量合法性：
+//   - 同一配方编号与版本号确定的物料列表内，每个物料编号只能出现一次。
+//     任一版本（包括尚未被任何批次使用的版本）出现重复物料编号，整份台账
+//     即视为损坏：不能由查询者挑其中一条作为依据，也不能合并重复项、相加
+//     克数或丢弃其中一条后继续——即使两条记录的克数完全相同也同样拒绝。
 //   - 每个配方版本的每种物料，每份克数必须是正数——与登记时的规则一致。
 //     任一版本（包括尚未被任何批次使用的版本）的任一物料为零或负数，
 //     整份台账即视为损坏：不能改成最小用量、取绝对值、删除问题物料
@@ -148,7 +153,13 @@ func validateState(st *persistedState) error {
 		if r == nil {
 			return fmt.Errorf("%w: 台账中存在空的配方记录", ErrCorruptData)
 		}
+		seen := make(map[string]bool, len(r.Materials))
 		for _, m := range r.Materials {
+			if seen[m.MaterialNo] {
+				return fmt.Errorf("%w: 配方 %q 版本 %q 的物料编号 %q 重复",
+					ErrCorruptData, r.RecipeNo, r.Version, m.MaterialNo)
+			}
+			seen[m.MaterialNo] = true
 			if m.GramsMilli <= 0 {
 				return fmt.Errorf("%w: 配方 %q 版本 %q 物料 %q 的每份克数不是正数",
 					ErrCorruptData, r.RecipeNo, r.Version, m.MaterialNo)
