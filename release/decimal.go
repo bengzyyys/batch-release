@@ -3,6 +3,7 @@ package release
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -10,6 +11,10 @@ import (
 
 // gramsMilli 以千分之一克为单位定点存储克数，避免浮点误差。
 type gramsMilli int64
+
+// maxGramsMilli 是同一批次内每种物料累计实投的上限，
+// 即 9223372036854775.807 克（math.MaxInt64 个千分之一克）。
+const maxGramsMilli gramsMilli = math.MaxInt64
 
 var gramsPattern = regexp.MustCompile(`^(\d+)(?:\.(\d{1,3}))?$`)
 
@@ -38,6 +43,11 @@ func parseGrams(s string) (gramsMilli, error) {
 		if err != nil {
 			return 0, fmt.Errorf("克数 %q 不合法", s)
 		}
+	}
+	// 先做溢出检查，避免整数回绕把超大克数变成较小的值。
+	if whole > int64(maxGramsMilli)/1000 ||
+		(whole == int64(maxGramsMilli)/1000 && frac > int64(maxGramsMilli)%1000) {
+		return 0, fmt.Errorf("克数 %q 超出范围：单次数量不能超过 %s 克", s, maxGramsMilli)
 	}
 	milli := whole*1000 + frac
 	if milli <= 0 {

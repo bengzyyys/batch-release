@@ -203,6 +203,9 @@ func (s *Store) CloseBatch(reqNo, batchNo string) (*BatchView, error) {
 // 投料包含物料编号、克数（正数、最多三位小数）、投料时间和登记人；
 // 物料必须属于该批次绑定的配方版本。允许实际投料不足或超过应投量；
 // 已登记的投料不能修改或删除，关闭后也不能追加。
+// 同一批次内每种物料的累计实投量（仅按该物料统计）上限为
+// 9223372036854775.807 克，本次投料后恰好等于上限仍允许，超过则返回
+// ErrInvalidInput 且不保存本次投料。
 // 投料按成功登记的先后顺序编号，不按投料时间重排。
 func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time, registrar string) (*FeedingView, error) {
 	payload := addFeedingPayload{
@@ -222,7 +225,7 @@ func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time
 		}
 		milli, err := parseGrams(grams)
 		if err != nil {
-			return nil, fmt.Errorf("%w: 克数: %v", ErrInvalidInput, err)
+			return nil, fmt.Errorf("%w: 物料 %q 的克数: %v", ErrInvalidInput, materialNo, err)
 		}
 		b := findBatch(st, batchNo)
 		if b == nil {
@@ -245,6 +248,14 @@ func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time
 		if !belongs {
 			return nil, fmt.Errorf("%w: 物料 %q 不在配方 %q 版本 %q 中",
 				ErrMaterialNotInRecipe, materialNo, r.RecipeNo, r.Version)
+		}
+
+		// 上限按物料分别判断：只累计该物料已登记的投料，
+		// 其他物料的投料量不参与，也不互相抵消。
+		summed, ok := sumMaterialGrams(b, materialNo)
+		if !ok || summed > maxGramsMilli-milli {
+			return nil, fmt.Errorf("%w: 物料 %q 的数量超出范围：本次投料后累计实投将超过上限 %s 克",
+				ErrInvalidInput, materialNo, maxGramsMilli)
 		}
 
 		seq := len(b.Feedings) + 1

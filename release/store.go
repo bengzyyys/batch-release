@@ -262,7 +262,6 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		Materials:       make([]MaterialRequirement, 0, len(r.Materials)),
 	}
 
-	actual := map[string]gramsMilli{}
 	for _, f := range b.Feedings {
 		v.Feedings = append(v.Feedings, FeedingView{
 			Seq:        f.Seq,
@@ -271,7 +270,6 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 			Time:       f.Time,
 			Registrar:  f.Registrar,
 		})
-		actual[f.MaterialNo] += f.GramsMilli
 	}
 
 	for _, m := range r.Materials {
@@ -279,7 +277,11 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		if err != nil {
 			return nil, fmt.Errorf("批次 %q 数量核对失败: %w", b.BatchNo, err)
 		}
-		act := actual[m.MaterialNo]
+		act, ok := sumMaterialGrams(b, m.MaterialNo)
+		if !ok {
+			return nil, fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出可表示范围",
+				ErrCorruptData, b.BatchNo, m.MaterialNo)
+		}
 		v.Materials = append(v.Materials, MaterialRequirement{
 			MaterialNo:      m.MaterialNo,
 			RequiredGrams:   required.String(),
@@ -306,4 +308,21 @@ func findBatch(st *persistedState, batchNo string) *batchRecord {
 		}
 	}
 	return nil
+}
+
+// sumMaterialGrams 统计批次内某物料已登记投料的累计千分之一克数。
+// 仅统计该物料的记录，其他物料不参与；返回 ok=false 表示仅已有记录
+// 的合计就已经超过可表示上限（AddFeeding 的登记前校验会阻止这种状态，
+// 这里仍防一手整数回绕）。
+func sumMaterialGrams(b *batchRecord, materialNo string) (sum gramsMilli, ok bool) {
+	for _, f := range b.Feedings {
+		if f.MaterialNo != materialNo {
+			continue
+		}
+		if f.GramsMilli > maxGramsMilli-sum {
+			return maxGramsMilli, false
+		}
+		sum += f.GramsMilli
+	}
+	return sum, true
 }
