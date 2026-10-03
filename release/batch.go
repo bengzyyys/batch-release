@@ -265,8 +265,15 @@ func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time
 
 		// 上限按物料分别判断：只累计该物料已登记的投料，
 		// 其他物料的投料量不参与，也不互相抵消。
-		summed, ok := sumMaterialGrams(b, materialNo)
-		if !ok || summed > maxGramsMilli-milli {
+		acc := newFeedingAccumulator()
+		fit := true
+		for _, f := range b.Feedings {
+			if !acc.add(f.MaterialNo, f.GramsMilli) {
+				fit = false
+				break
+			}
+		}
+		if !fit || !acc.add(materialNo, milli) {
 			return nil, fmt.Errorf("%w: 物料 %q 的数量超出范围：本次投料后累计实投将超过上限 %s 克",
 				ErrInvalidInput, materialNo, maxGramsMilli)
 		}

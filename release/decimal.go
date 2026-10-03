@@ -16,6 +16,36 @@ type gramsMilli int64
 // 即 9223372036854775.807 克（math.MaxInt64 个千分之一克）。
 const maxGramsMilli gramsMilli = math.MaxInt64
 
+// feedingAccumulator 按物料累计一个批次内的实投量（千分之一克）。
+// 追加投料、读取台账校验与批次数量核对共用这一套数量规则：
+// 累计范围始终是一个批次中的一种物料，其他物料与其他批次的数量
+// 不参与，物料之间也不互相抵消；任一物料的累计上限为 maxGramsMilli，
+// 恰好达到上限合法，再增加 0.001 克即判超限。累计不回绕、不截断、
+// 不舍入，精确到千分之一克。
+type feedingAccumulator struct {
+	sums map[string]gramsMilli
+}
+
+func newFeedingAccumulator() *feedingAccumulator {
+	return &feedingAccumulator{sums: map[string]gramsMilli{}}
+}
+
+// add 计入一条该物料的投料；计入后会超过上限时返回 false 且不计入，
+// 已有累计保持不变。
+func (a *feedingAccumulator) add(materialNo string, g gramsMilli) bool {
+	sum := a.sums[materialNo]
+	if g > maxGramsMilli-sum {
+		return false
+	}
+	a.sums[materialNo] = sum + g
+	return true
+}
+
+// total 返回该物料的累计实投量；无投料记录时为零。
+func (a *feedingAccumulator) total(materialNo string) gramsMilli {
+	return a.sums[materialNo]
+}
+
 var gramsPattern = regexp.MustCompile(`^(\d+)(?:\.(\d{1,3}))?$`)
 
 // parseGrams 将克数字符串精确解析为千分之一克。

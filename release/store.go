@@ -177,7 +177,7 @@ func validateState(st *persistedState) error {
 // 实投是否符合配方：无投料的物料累计为零属正常，不足或超过应投量也不
 // 在此拒绝。
 func validateFeedings(b *batchRecord, r *recipeRecord) error {
-	sums := map[string]gramsMilli{}
+	acc := newFeedingAccumulator()
 	for _, f := range b.Feedings {
 		belongs := false
 		for _, m := range r.Materials {
@@ -194,12 +194,10 @@ func validateFeedings(b *batchRecord, r *recipeRecord) error {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的第 %d 条投料数量不是正数",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, f.Seq)
 		}
-		sum := sums[f.MaterialNo]
-		if f.GramsMilli > maxGramsMilli-sum {
+		if !acc.add(f.MaterialNo, f.GramsMilli) {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出上限 %s 克",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, maxGramsMilli)
 		}
-		sums[f.MaterialNo] = sum + f.GramsMilli
 	}
 	return nil
 }
@@ -356,16 +354,22 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		})
 	}
 
+	// 按物料累计实投量；台账在读取时已通过 validateFeedings 校验，
+	// 这里仍用同一套累计规则防一手整数回绕。
+	acc := newFeedingAccumulator()
+	for _, f := range b.Feedings {
+		if !acc.add(f.MaterialNo, f.GramsMilli) {
+			return nil, fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出可表示范围",
+				ErrCorruptData, b.BatchNo, f.MaterialNo)
+		}
+	}
+
 	for _, m := range r.Materials {
 		required, err := multiplyPortions(m.GramsMilli, b.PlannedPortions)
 		if err != nil {
 			return nil, fmt.Errorf("批次 %q 数量核对失败: %w", b.BatchNo, err)
 		}
-		act, ok := sumMaterialGrams(b, m.MaterialNo)
-		if !ok {
-			return nil, fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出可表示范围",
-				ErrCorruptData, b.BatchNo, m.MaterialNo)
-		}
+		act := acc.total(m.MaterialNo)
 		v.Materials = append(v.Materials, MaterialRequirement{
 			MaterialNo:      m.MaterialNo,
 			RequiredGrams:   required.String(),
@@ -392,21 +396,4 @@ func findBatch(st *persistedState, batchNo string) *batchRecord {
 		}
 	}
 	return nil
-}
-
-// sumMaterialGrams 统计批次内某物料已登记投料的累计千分之一克数。
-// 仅统计该物料的记录，其他物料不参与；返回 ok=false 表示仅已有记录
-// 的合计就已经超过可表示上限（AddFeeding 的登记前校验会阻止这种状态，
-// 这里仍防一手整数回绕）。
-func sumMaterialGrams(b *batchRecord, materialNo string) (sum gramsMilli, ok bool) {
-	for _, f := range b.Feedings {
-		if f.MaterialNo != materialNo {
-			continue
-		}
-		if f.GramsMilli > maxGramsMilli-sum {
-			return maxGramsMilli, false
-		}
-		sum += f.GramsMilli
-	}
-	return sum, true
 }
