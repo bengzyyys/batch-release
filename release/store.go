@@ -27,7 +27,8 @@ type Store struct {
 
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
-// 已有台账文件无法读取、解析，任一批次绑定的配方版本未登记，
+// 已有台账文件无法读取、解析，任一配方版本的任一物料每份克数不是正数，
+// 任一批次绑定的配方版本未登记，
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
 // 超过 9223372036854775.807 克）时，返回 ErrCorruptData（可用 errors.Is
@@ -127,7 +128,11 @@ func (s *Store) load() error {
 	return nil
 }
 
-// validateState 检查台账的引用完整性与投料数量合法性：
+// validateState 检查台账的引用完整性与数量合法性：
+//   - 每个配方版本的每种物料，每份克数必须是正数——与登记时的规则一致。
+//     任一版本（包括尚未被任何批次使用的版本）的任一物料为零或负数，
+//     整份台账即视为损坏：不能改成最小用量、取绝对值、删除问题物料
+//     或改用其他版本后继续，其他配方完整或批次数量恰好吻合也不能放行。
 //   - 每个批次记录的配方编号与版本号必须共同指向一个已登记的配方版本。
 //     任一批次找不到对应版本，整份台账即视为损坏——不能改用同编号的其他版本，
 //     也不能按名称或物料内容替换，即使其他批次仍然完整也不能放行本次读取。
@@ -139,6 +144,17 @@ func (s *Store) load() error {
 //     实际绑定的版本为准：物料只出现在同编号的其他版本或其他配方中，
 //     不能作为接受依据；也不能改选版本、补入物料或丢弃问题投料后继续。
 func validateState(st *persistedState) error {
+	for _, r := range st.Recipes {
+		if r == nil {
+			return fmt.Errorf("%w: 台账中存在空的配方记录", ErrCorruptData)
+		}
+		for _, m := range r.Materials {
+			if m.GramsMilli <= 0 {
+				return fmt.Errorf("%w: 配方 %q 版本 %q 物料 %q 的每份克数不是正数",
+					ErrCorruptData, r.RecipeNo, r.Version, m.MaterialNo)
+			}
+		}
+	}
 	for _, b := range st.Batches {
 		if b == nil {
 			return fmt.Errorf("%w: 台账中存在空的批次记录", ErrCorruptData)
