@@ -26,7 +26,9 @@ type Store struct {
 }
 
 // Open 打开（或首次使用）位于 dir 的台账。
-// 目录不存在时会创建；目录中没有台账文件时得到空台账；
+// 目录不存在时会创建；目录中没有台账文件时得到空台账。
+// 已有台账文件但内容为空（零字节）时按损坏处理——无法区分该文件原本就
+// 为空还是使用过程中被截断，不会当成空台账继续，也不会补写或还原内容。
 // 已有台账文件无法读取、解析，任一配方版本的任一物料每份克数不是正数，
 // 任一配方版本内同一物料编号出现多次，
 // 任一批次绑定的配方版本未登记，
@@ -109,8 +111,10 @@ func (s *Store) load() error {
 		return fmt.Errorf("%w: 读取台账文件失败: %v", ErrCorruptData, err)
 	}
 	if len(data) == 0 {
-		s.state = &persistedState{Version: stateVersion, Requests: map[string]*requestRecord{}}
-		return nil
+		// 区分“没有台账文件”（首次使用，得到空台账）与“已有文件但内容为空”。
+		// 零字节文件无法区分是首次写入前被截断还是使用过程中被清空，
+		// 一律按损坏处理：不能补写成合法空台账，也不能凭先前记录还原。
+		return fmt.Errorf("%w: 台账文件没有内容（零字节），数据无法读取", ErrCorruptData)
 	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {

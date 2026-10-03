@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -799,12 +800,28 @@ func TestCorruptData(t *testing.T) {
 		t.Fatalf("不支持的版本应返回 ErrCorruptData，得到 %v", err)
 	}
 
-	// 空文件视为空台账（首次使用），可以正常打开。
+	// 已有文件但内容为空（零字节）按损坏处理，不能当成空台账打开，
+	// 也不得补写成合法空台账。
 	if err := os.WriteFile(filepath.Join(dir, "ledger.json"), []byte{}, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(dir); err != nil {
-		t.Fatalf("空文件应视为空台账: %v", err)
+	s2, err := Open(dir)
+	if !errors.Is(err, ErrCorruptData) {
+		t.Fatalf("零字节台账应返回 ErrCorruptData，得到 %v", err)
+	}
+	if s2 != nil {
+		s2.Close()
+		t.Fatalf("损坏台账不应返回可用的 Store 对象")
+	}
+	if !strings.Contains(err.Error(), "没有内容") {
+		t.Fatalf("错误信息应说明台账文件没有内容，得到 %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, stateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("打开失败不应补写零字节台账，文件大小=%d", info.Size())
 	}
 }
 
