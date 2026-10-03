@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -904,6 +905,96 @@ func TestCrossProcessConcurrent(t *testing.T) {
 	}
 	if got.Materials[0].ActualGrams != "40" {
 		t.Fatalf("累计实投应为 40，得到 %s", got.Materials[0].ActualGrams)
+	}
+}
+
+// 累计实投上限：同一批次内每种物料累计上限 9223372036854775.807 克，
+// 按物料分别判断；恰好等于上限允许，超过返回 ErrInvalidInput。
+func TestAddFeedingCumulativeCap(t *testing.T) {
+	s := openTestStore(t)
+	registerStandardRecipe(t, s, "recipe-1") // M1=100, M2=0.5, M3=0.010
+	if _, err := s.CreateBatch("b1", "B1", "R1", "v1", 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StartBatch("s1", "B1"); err != nil {
+		t.Fatal(err)
+	}
+
+	const cap = "9223372036854775.807"
+
+	// 已累计 9223372036854775.806，再登记 0.001 恰好等于上限，应成功。
+	if _, err := s.AddFeeding("f1", "B1", "M1", "9223372036854775.806", time.Now(), "张三"); err != nil {
+		t.Fatalf("累计未超过上限应成功，得到 %v", err)
+	}
+	f2, err := s.AddFeeding("f2", "B1", "M1", "0.001", time.Now(), "张三")
+	if err != nil {
+		t.Fatalf("累计恰好等于上限应成功，得到 %v", err)
+	}
+	if f2.Seq != 2 {
+		t.Fatalf("成功登记序号应为 2，得到 %d", f2.Seq)
+	}
+
+	// 再登记 0.001 会超过上限，必须失败并指出物料。
+	_, err = s.AddFeeding("f3", "B1", "M1", "0.001", time.Now(), "张三")
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("累计超过上限应返回 ErrInvalidInput，得到 %v", err)
+	}
+	if !strings.Contains(err.Error(), "M1") {
+		t.Fatalf("错误信息应指出是哪种物料，得到 %v", err)
+	}
+
+	// 单次输入本身超过上限也拒绝，不能回绕成较小的合法克数后接受。
+	for _, g := range []string{"9223372036854775.808", "18446744073709551.616", "9999999999999999999"} {
+		if _, err := s.AddFeeding("f-big-"+g, "B1", "M2", g, time.Now(), "张三"); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("克数 %s 超过上限应返回 ErrInvalidInput，得到 %v", g, err)
+		}
+	}
+
+	// 上限按物料分别判断：M1 已满不影响其他物料；M2 投到上限应成功。
+	if _, err := s.AddFeeding("f4", "B1", "M2", cap, time.Now(), "李四"); err != nil {
+		t.Fatalf("其他物料累计不受 M1 影响，应成功，得到 %v", err)
+	}
+	// M2 也满后，再投最小精度即失败。
+	if _, err := s.AddFeeding("f5", "B1", "M2", "0.001", time.Now(), "李四"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("M2 累计超过上限应返回 ErrInvalidInput，得到 %v", err)
+	}
+
+	// 被拒绝的请求不占用编号、不推进序号、不改变状态：修正数量后仍可提交。
+	if _, err := s.AddFeeding("f5", "B1", "M3", "0.001", time.Now(), "王五"); err != nil {
+		t.Fatalf("失败不应占用请求编号，合法提交应成功: %v", err)
+	}
+
+	view, err := s.GetBatch("B1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 成功的投料只有：M1 两条、M2 一条、M3 一条。
+	if len(view.Feedings) != 4 {
+		t.Fatalf("被拒绝的投料不应保存，应只有 4 条，得到 %d 条: %+v", len(view.Feedings), view.Feedings)
+	}
+	if view.Feedings[3].Seq != 4 || view.Feedings[3].MaterialNo != "M3" {
+		t.Fatalf("被拒绝的登记不应占用序号，最后一条应为 seq=4 M3，得到 %+v", view.Feedings[3])
+	}
+	if view.Status != StatusExecuting {
+		t.Fatalf("被拒绝的投料不应改变批次状态，得到 %s", view.Status)
+	}
+
+	got := map[string]MaterialRequirement{}
+	for _, m := range view.Materials {
+		got[m.MaterialNo] = m
+	}
+	// 成功登记的克数必须完整计入核对结果，实投与差额准确、不为负。
+	if got["M1"].ActualGrams != cap {
+		t.Fatalf("M1 累计实投应为上限 %s，得到 %s", cap, got["M1"].ActualGrams)
+	}
+	if got["M1"].DifferenceGrams != "9223372036853775.807" {
+		t.Fatalf("M1 差额（实投减应投 1000）不正确: %s", got["M1"].DifferenceGrams)
+	}
+	if got["M2"].ActualGrams != cap {
+		t.Fatalf("M2 累计实投应为上限 %s，得到 %s", cap, got["M2"].ActualGrams)
+	}
+	if got["M3"].ActualGrams != "0.001" || got["M3"].DifferenceGrams != "-0.099" {
+		t.Fatalf("M3 核对不正确: %+v", got["M3"])
 	}
 }
 

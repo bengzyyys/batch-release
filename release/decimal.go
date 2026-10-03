@@ -11,6 +11,11 @@ import (
 // gramsMilli 以千分之一克为单位定点存储克数，避免浮点误差。
 type gramsMilli int64
 
+// maxGramsMilli 是克数上限：9223372036854775.807 克，
+// 以千分之一克计恰好是 int64 最大值。
+// 同一批次内每种物料的单次投料量与累计实投量都不得超过它（恰好相等允许）。
+const maxGramsMilli gramsMilli = 1<<63 - 1
+
 var gramsPattern = regexp.MustCompile(`^(\d+)(?:\.(\d{1,3}))?$`)
 
 // parseGrams 将克数字符串精确解析为千分之一克。
@@ -38,6 +43,11 @@ func parseGrams(s string) (gramsMilli, error) {
 		if err != nil {
 			return 0, fmt.Errorf("克数 %q 不合法", s)
 		}
+	}
+	// 检查 whole*1000 + frac 是否超过上限，避免整数回绕把大数变成较小的合法值。
+	const maxWhole = int64(maxGramsMilli) / 1000
+	if whole > maxWhole || (whole == maxWhole && frac > int64(maxGramsMilli)%1000) {
+		return 0, fmt.Errorf("克数 %q 超出范围：单次投料不得超过 %s 克", s, maxGramsMilli)
 	}
 	milli := whole*1000 + frac
 	if milli <= 0 {
