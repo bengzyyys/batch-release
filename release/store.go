@@ -28,8 +28,9 @@ type Store struct {
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
 // 已有台账文件无法读取、解析，任一批次绑定的配方版本未登记，
-// 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
-// 超过 9223372036854775.807 克）时，返回 ErrCorruptData（可用 errors.Is
+// 已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
+// 超过 9223372036854775.807 克），或已保存的投料物料不属于该批次
+// 绑定的配方编号与版本号时，返回 ErrCorruptData（可用 errors.Is
 // 判断），不会当成空台账继续保存，也不会返回可继续使用的台账对象。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -126,10 +127,15 @@ func (s *Store) load() error {
 	return nil
 }
 
-// validateState 检查台账的引用完整性与投料数量合法性：
+// validateState 检查台账的引用完整性、投料物料归属与数量合法性：
 //   - 每个批次记录的配方编号与版本号必须共同指向一个已登记的配方版本。
 //     任一批次找不到对应版本，整份台账即视为损坏——不能改用同编号的其他版本，
 //     也不能按名称或物料内容替换，即使其他批次仍然完整也不能放行本次读取。
+//   - 每条已保存投料的物料编号必须属于该批次实际绑定的配方版本
+//     （配方编号与版本号共同确定的物料列表）。归属只看绑定版本：
+//     物料存在于同编号的其他版本或另一配方中都不能作为接受依据，
+//     即使投料数量为正、未超上限也不行。任一条投料不属于绑定版本，
+//     整份台账即视为损坏——不能改选版本、补入物料、丢弃该记录后继续核对。
 //   - 每条已保存的投料数量必须是正数；同一批次内同一物料的累计实投
 //     不得超过 maxGramsMilli（9223372036854775.807 克）。任一记录为零或
 //     负数，或任一物料累计超限，整份台账即视为损坏——负数记录即使能被
@@ -139,23 +145,36 @@ func validateState(st *persistedState) error {
 		if b == nil {
 			return fmt.Errorf("%w: 台账中存在空的批次记录", ErrCorruptData)
 		}
-		if findRecipe(st, b.RecipeNo, b.RecipeVersion) == nil {
+		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		if r == nil {
 			return fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
 				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
 		}
-		if err := validateFeedings(b); err != nil {
+		if err := validateFeedings(b, r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// validateFeedings 检查一个批次内已保存投料的数量合法性。
-// 只判断数量本身是否合法，不判断实投是否符合配方：无投料的物料
-// 累计为零属正常，不足或超过应投量也不在此拒绝。
-func validateFeedings(b *batchRecord) error {
+// validateFeedings 检查一个批次内已保存投料的物料归属与数量合法性。
+// 物料必须属于该批次绑定的配方版本 r；数量只判断本身是否合法，
+// 不判断实投是否符合应投量：无投料的物料累计为零属正常，
+// 不足或超过应投量也不在此拒绝。
+func validateFeedings(b *batchRecord, r *recipeRecord) error {
 	sums := map[string]gramsMilli{}
 	for _, f := range b.Feedings {
+		belongs := false
+		for _, m := range r.Materials {
+			if m.MaterialNo == f.MaterialNo {
+				belongs = true
+				break
+			}
+		}
+		if !belongs {
+			return fmt.Errorf("%w: 批次 %q 物料 %q 不属于绑定的配方 %q 版本 %q",
+				ErrCorruptData, b.BatchNo, f.MaterialNo, r.RecipeNo, r.Version)
+		}
 		if f.GramsMilli <= 0 {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的第 %d 条投料数量不是正数",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, f.Seq)
