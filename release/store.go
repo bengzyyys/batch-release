@@ -28,6 +28,9 @@ type Store struct {
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
 // 已有台账文件但无法读取或解析时返回 ErrCorruptData，不会当成空台账继续保存。
+// 台账中每个批次绑定的配方编号与版本号，都必须能共同找到一个已登记的配方版本；
+// 只要有一个批次找不到（配方编号相同但版本不同也算缺失），同样返回
+// ErrCorruptData，且不会返回可继续使用的台账对象，原台账内容保持不变。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("数据位置不能为空")
@@ -113,10 +116,27 @@ func (s *Store) load() error {
 	if st.Version != stateVersion {
 		return fmt.Errorf("%w: 台账版本 %d 不受支持", ErrCorruptData, st.Version)
 	}
+	if err := validateBatchRecipes(&st); err != nil {
+		return err
+	}
 	if st.Requests == nil {
 		st.Requests = map[string]*requestRecord{}
 	}
 	s.state = &st
+	return nil
+}
+
+// validateBatchRecipes 校验每个批次记录绑定的配方编号与版本号，
+// 必须能共同找到一个已登记的配方版本。配方编号相同而版本不同仍算缺失，
+// 不能改用该配方的其他版本；只要有一个批次找不到，就返回带批次编号及其
+// 所需配方编号、版本号的 ErrCorruptData，使调用方在读取台账时即得到明确失败。
+func validateBatchRecipes(st *persistedState) error {
+	for _, b := range st.Batches {
+		if findRecipe(st, b.RecipeNo, b.RecipeVersion) == nil {
+			return fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 在台账中不存在",
+				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+		}
+	}
 	return nil
 }
 
