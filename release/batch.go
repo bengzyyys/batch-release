@@ -120,6 +120,10 @@ func (s *Store) UpdateDraftBatch(reqNo, batchNo, newRecipeNo, newVersion string,
 			b.RecipeVersion = newVersion
 		}
 		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		if r == nil {
+			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
+				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+		}
 		view, err := buildBatchView(b, r)
 		if err != nil {
 			return nil, err
@@ -151,6 +155,10 @@ func (s *Store) StartBatch(reqNo, batchNo string) (*BatchView, error) {
 		}
 		b.Status = StatusExecuting
 		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		if r == nil {
+			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
+				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+		}
 		view, err := buildBatchView(b, r)
 		if err != nil {
 			return nil, err
@@ -183,6 +191,10 @@ func (s *Store) CloseBatch(reqNo, batchNo string) (*BatchView, error) {
 		}
 		b.Status = StatusClosed
 		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		if r == nil {
+			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
+				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+		}
 		view, err := buildBatchView(b, r)
 		if err != nil {
 			return nil, err
@@ -236,7 +248,8 @@ func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time
 		}
 		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
 		if r == nil {
-			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方版本不存在", ErrCorruptData, batchNo)
+			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
+				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
 		}
 		belongs := false
 		for _, m := range r.Materials {
