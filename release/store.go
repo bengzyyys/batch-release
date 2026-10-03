@@ -194,12 +194,12 @@ func validateFeedings(b *batchRecord, r *recipeRecord) error {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的第 %d 条投料数量不是正数",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, f.Seq)
 		}
-		sum := sums[f.MaterialNo]
-		if f.GramsMilli > maxGramsMilli-sum {
+		sum, ok := addGrams(sums[f.MaterialNo], f.GramsMilli)
+		if !ok {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出上限 %s 克",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, maxGramsMilli)
 		}
-		sums[f.MaterialNo] = sum + f.GramsMilli
+		sums[f.MaterialNo] = sum
 	}
 	return nil
 }
@@ -396,17 +396,16 @@ func findBatch(st *persistedState, batchNo string) *batchRecord {
 
 // sumMaterialGrams 统计批次内某物料已登记投料的累计千分之一克数。
 // 仅统计该物料的记录，其他物料不参与；返回 ok=false 表示仅已有记录
-// 的合计就已经超过可表示上限（AddFeeding 的登记前校验会阻止这种状态，
-// 这里仍防一手整数回绕）。
+// 的合计就已经超过上限（AddFeeding 的登记前校验会阻止这种状态，
+// 这里仍按同一累计规则防一手整数回绕）。
 func sumMaterialGrams(b *batchRecord, materialNo string) (sum gramsMilli, ok bool) {
 	for _, f := range b.Feedings {
 		if f.MaterialNo != materialNo {
 			continue
 		}
-		if f.GramsMilli > maxGramsMilli-sum {
+		if sum, ok = addGrams(sum, f.GramsMilli); !ok {
 			return maxGramsMilli, false
 		}
-		sum += f.GramsMilli
 	}
 	return sum, true
 }

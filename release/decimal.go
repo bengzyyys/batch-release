@@ -56,6 +56,16 @@ func parseGrams(s string) (gramsMilli, error) {
 	return gramsMilli(milli), nil
 }
 
+// addGrams 把一条数量累加到累计值上，是各处共用的累计规则：
+// 结果恰好等于 maxGramsMilli 合法，再多半毫（0.001 克）即超限。
+// 返回 ok=false 表示超限，此时不会发生整数回绕，累计值保持原样。
+func addGrams(sum, delta gramsMilli) (gramsMilli, bool) {
+	if delta > maxGramsMilli-sum {
+		return sum, false
+	}
+	return sum + delta, true
+}
+
 // String 将千分之一克格式化为克数字符串，去掉末尾多余的 0。
 func (g gramsMilli) String() string {
 	sign := ""
