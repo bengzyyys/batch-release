@@ -125,10 +125,13 @@ func (s *Store) load() error {
 	return nil
 }
 
-// validateState 检查台账的引用完整性：每个批次记录的配方编号与版本号
-// 必须共同指向一个已登记的配方版本。任一批次找不到对应版本，整份台账
-// 即视为损坏——不能改用同编号的其他版本，也不能按名称或物料内容替换，
-// 即使其他批次仍然完整也不能放行本次读取。
+// validateState 检查台账的引用完整性与数量合法性：
+// 每个批次记录的配方编号与版本号必须共同指向一个已登记的配方版本；
+// 每条已保存投料必须是正数，且同一批次内同一物料的累计实投不得超过上限。
+// 任一批次找不到对应版本或存在非法投料，整份台账即视为损坏——不能改用同编号
+// 的其他版本，也不能按名称或物料内容替换；不能忽略非法投料、改成零或截成
+// 上限后继续返回看似正常的核对结果，即使其他批次仍然完整、即使负数与正数
+// 相加后落在范围内也不能放行本次读取。
 func validateState(st *persistedState) error {
 	for _, b := range st.Batches {
 		if b == nil {
@@ -138,6 +141,34 @@ func validateState(st *persistedState) error {
 			return fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
 				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
 		}
+		if err := validateFeedings(b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFeedings 在台账被继续使用之前，对批次内已保存投料的数量本身
+// 下确定结论（这里判断的是数量是否合法，不是实投是否符合配方：不足或超过
+// 应投量都正常）。逐条检查：
+//   - 单条投料必须为正数；零或负数即损坏，错误指出该条的登记序号；
+//   - 累计只按同一物料统计（其他物料不参与、不相加），超过
+//     maxGramsMilli 即损坏；恰好等于上限允许。
+func validateFeedings(b *batchRecord) error {
+	sums := make(map[string]gramsMilli)
+	for _, f := range b.Feedings {
+		if f.GramsMilli <= 0 {
+			return fmt.Errorf("%w: 批次 %q 物料 %q 的第 %d 条投料不是正数（投料克数必须大于 0）",
+				ErrCorruptData, b.BatchNo, f.MaterialNo, f.Seq)
+		}
+		sum := sums[f.MaterialNo]
+		// 此前的累计已确保不超过上限，maxGramsMilli-sum 非负，
+		// 比较与随后的相加都不会整数回绕。
+		if f.GramsMilli > maxGramsMilli-sum {
+			return fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超过上限 %s 克",
+				ErrCorruptData, b.BatchNo, f.MaterialNo, maxGramsMilli)
+		}
+		sums[f.MaterialNo] = sum + f.GramsMilli
 	}
 	return nil
 }
@@ -301,6 +332,9 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		}
 		act, ok := sumMaterialGrams(b, m.MaterialNo)
 		if !ok {
+			// 正常流程到不了这里：load 时的 validateFeedings 已对整份台账
+			// 下过数量合法的结论。保留作为防整数回绕的兜底，绝不截成上限
+			// 后继续返回看似正常的核对结果。
 			return nil, fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出可表示范围",
 				ErrCorruptData, b.BatchNo, m.MaterialNo)
 		}
