@@ -19,6 +19,9 @@ const (
 // Store 是一个本地配方批次台账，数据保存在调用方指定的目录中。
 // 不同目录互相独立；多个 Store 可以安全并发提交（进程内互斥、进程间文件锁）。
 type Store struct {
+	// dir 是打开时确定的绝对路径。即使传入相对目录，也在 Open 时按当时的
+	// 工作目录解析并固定下来：此后调用方切换进程工作目录，本对象的读取与
+	// 保存仍指向最初打开的位置，绝不会按新工作目录重新解释这个相对路径。
 	dir      string
 	lockFile *os.File
 	mu       sync.Mutex
@@ -41,28 +44,44 @@ type Store struct {
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
 // 超过 9223372036854775.807 克）时，返回 ErrCorruptData（可用 errors.Is
 // 判断），不会当成空台账继续保存，也不会返回可继续使用的台账对象。
+//
+// dir 可以是相对目录：其位置只按 Open 调用时的工作目录解析一次并固定。
+// 打开之后即使进程切换了工作目录，本对象的查询与保存仍始终指向最初打开
+// 的目录，不会按新工作目录重新解释相对路径；台账操作本身也不会改变调用
+// 方的工作目录。切换工作目录后另行 Open 同一相对目录，得到的是绑定新位
+// 置的独立对象，与此前的对象互不影响。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("数据位置不能为空")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建数据位置 %q 失败: %w", dir, err)
-	}
-	info, err := os.Stat(dir)
+	// 先按“打开那一刻”的工作目录把位置解析成绝对路径并固定。后续每次
+	// 查询与写入都会重新读取台账文件，若仍持有相对路径，调用方一旦切换
+	// 工作目录，相对路径就会指向别处——可能把已登记批次查成不存在，或把
+	// 变更读写到另一个同名台账。解析为绝对路径后，本对象始终绑定最初打
+	// 开的位置。filepath.Abs 只做词法解析、不访问文件系统，目录尚不存在
+	// （首次使用会自动创建）时也能得到稳定结果。
+	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return nil, fmt.Errorf("读取数据位置 %q 失败: %w", dir, err)
+		return nil, fmt.Errorf("解析数据位置 %q 失败: %w", dir, err)
+	}
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		return nil, fmt.Errorf("创建数据位置 %q 失败: %w", absDir, err)
+	}
+	info, err := os.Stat(absDir)
+	if err != nil {
+		return nil, fmt.Errorf("读取数据位置 %q 失败: %w", absDir, err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("数据位置 %q 不是目录", dir)
+		return nil, fmt.Errorf("数据位置 %q 不是目录", absDir)
 	}
 
-	lockPath := filepath.Join(dir, lockFileName)
+	lockPath := filepath.Join(absDir, lockFileName)
 	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("打开锁文件失败: %w", err)
 	}
 
-	s := &Store{dir: dir, lockFile: lf}
+	s := &Store{dir: absDir, lockFile: lf}
 	if err := s.load(); err != nil {
 		lf.Close()
 		return nil, err
