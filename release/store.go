@@ -45,6 +45,17 @@ func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("数据位置不能为空")
 	}
+	// 相对目录只按“本次打开时”的工作目录解析，并立即固定为绝对路径：
+	// 台账位置绑定在这一次 Open 上，调用方之后切换进程工作目录，既不能让
+	// 后续查询/保存按新工作目录重新解释这个相对目录（读到或写到另一个同名
+	// 台账），也不能把已打开的位置当成空台账。这里只读取当前工作目录做
+	// 词法拼接，绝不改变调用方的工作目录；传入的本来就是绝对路径时保持
+	// 等价语义。
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("解析数据位置 %q 失败: %w", dir, err)
+	}
+	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建数据位置 %q 失败: %w", dir, err)
 	}
