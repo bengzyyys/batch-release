@@ -161,28 +161,7 @@ func (s *Store) StartBatch(reqNo, batchNo string) (*BatchView, error) {
 	payload := startBatchPayload{BatchNo: batchNo}
 	var out BatchView
 	err := s.write(reqNo, opStartBatch, payload, func(st *persistedState) (json.RawMessage, error) {
-		b := findBatch(st, batchNo)
-		if b == nil {
-			return nil, fmt.Errorf("%w: 批次 %q", ErrNotFound, batchNo)
-		}
-		if b.Status != StatusDraft {
-			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，只有草稿可以开始执行", ErrInvalidState, batchNo, b.Status)
-		}
-		b.Status = StatusExecuting
-		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
-		if r == nil {
-			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
-				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
-		}
-		view, err := buildBatchView(b, r)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := json.Marshal(view)
-		if err != nil {
-			return nil, err
-		}
-		return raw, nil
+		return transitionBatchStatus(st, batchNo, StatusDraft, StatusExecuting, "只有草稿可以开始执行")
 	}, &out)
 	if err != nil {
 		return nil, err
@@ -197,33 +176,42 @@ func (s *Store) CloseBatch(reqNo, batchNo string) (*BatchView, error) {
 	payload := closeBatchPayload{BatchNo: batchNo}
 	var out BatchView
 	err := s.write(reqNo, opCloseBatch, payload, func(st *persistedState) (json.RawMessage, error) {
-		b := findBatch(st, batchNo)
-		if b == nil {
-			return nil, fmt.Errorf("%w: 批次 %q", ErrNotFound, batchNo)
-		}
-		if b.Status != StatusExecuting {
-			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，只有执行中的批次可以关闭", ErrInvalidState, batchNo, b.Status)
-		}
-		b.Status = StatusClosed
-		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
-		if r == nil {
-			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
-				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
-		}
-		view, err := buildBatchView(b, r)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := json.Marshal(view)
-		if err != nil {
-			return nil, err
-		}
-		return raw, nil
+		return transitionBatchStatus(st, batchNo, StatusExecuting, StatusClosed, "只有执行中的批次可以关闭")
 	}, &out)
 	if err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// transitionBatchStatus 是批次状态变更（开始执行、关闭）的统一实现：
+// 找到批次后要求当前状态为 from，否则按 ErrInvalidState 拒绝（批次不存在
+// 按 ErrNotFound 拒绝，两种情况下状态与投料都不变）；通过后将状态改为 to，
+// 并按变更后的记录构造返回视图。rule 说明该变更的准入规则，用于状态不符时
+// 的错误信息。配方版本、计划份数与已有投料均保持原样。
+func transitionBatchStatus(st *persistedState, batchNo string, from, to BatchStatus, rule string) (json.RawMessage, error) {
+	b := findBatch(st, batchNo)
+	if b == nil {
+		return nil, fmt.Errorf("%w: 批次 %q", ErrNotFound, batchNo)
+	}
+	if b.Status != from {
+		return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，%s", ErrInvalidState, batchNo, b.Status, rule)
+	}
+	b.Status = to
+	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+	if r == nil {
+		return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
+			ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	view, err := buildBatchView(b, r)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(view)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // AddFeeding 向执行中的批次追加一次投料。
