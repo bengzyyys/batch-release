@@ -28,7 +28,8 @@ type Store struct {
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
 // 台账文件已存在但没有任何内容（零字节，无论原本就是空文件还是使用中被截断）
-// 时按损坏处理；已有台账文件无法读取、解析，任一配方版本的任一物料每份克数不是正数，
+// 时按损坏处理；已有台账文件无法读取、解析，存在两条配方编号与版本号
+// 完全相同的配方记录，任一配方版本的任一物料每份克数不是正数，
 // 任一配方版本内同一物料编号出现多次，
 // 任一批次绑定的配方版本未登记，
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
@@ -133,6 +134,12 @@ func (s *Store) load() error {
 }
 
 // validateState 检查台账的引用完整性与数量合法性：
+//   - 配方由配方编号与版本号共同识别，同一台账内每组编号+版本号只能
+//     对应一条配方记录。只要同组出现第二条记录，无论名称、物料、每份克数
+//     是否相同（即使内容完全一致），整份台账即视为损坏：不能挑第一条或
+//     最后一条、不能合并物料、也不能自行删除一条后继续——重复记录会让
+//     查询结果与批次的应投依据取决于文件中的排列顺序。重复版本即使尚未
+//     被任何批次引用也一样拒绝，其他配方与批次完整也不能放行本次读取。
 //   - 每个配方版本的每种物料，每份克数必须是正数——与登记时的规则一致。
 //     任一版本（包括尚未被任何批次使用的版本）的任一物料为零或负数，
 //     整份台账即视为损坏：不能改成最小用量、取绝对值、删除问题物料
@@ -153,10 +160,23 @@ func (s *Store) load() error {
 //     实际绑定的版本为准：物料只出现在同编号的其他版本或其他配方中，
 //     不能作为接受依据；也不能改选版本、补入物料或丢弃问题投料后继续。
 func validateState(st *persistedState) error {
+	// 先按“配方编号 + 版本号”唯一标识遍历全部配方记录：同组出现第二条
+	// 记录即数据损坏，必须先于一切按标识查找的校验拒绝——否则重复记录
+	// 会让 findRecipe 总是返回排在前面的一条，查询结果与批次应投依据都
+	// 取决于文件排列顺序。完全相同的内容也不是合法重复。
+	versions := make(map[recipeKey]bool, len(st.Recipes))
 	for _, r := range st.Recipes {
 		if r == nil {
 			return fmt.Errorf("%w: 台账中存在空的配方记录", ErrCorruptData)
 		}
+		key := recipeKey{r.RecipeNo, r.Version}
+		if versions[key] {
+			return fmt.Errorf("%w: 配方编号 %q 版本号 %q 的配方记录重复",
+				ErrCorruptData, r.RecipeNo, r.Version)
+		}
+		versions[key] = true
+	}
+	for _, r := range st.Recipes {
 		seen := make(map[string]bool, len(r.Materials))
 		for _, m := range r.Materials {
 			if seen[m.MaterialNo] {
@@ -401,6 +421,12 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		})
 	}
 	return v, nil
+}
+
+// recipeKey 是配方的唯一标识：配方编号与版本号的组合，采用精确匹配。
+type recipeKey struct {
+	recipeNo string
+	version  string
 }
 
 func findRecipe(st *persistedState, recipeNo, version string) *recipeRecord {
