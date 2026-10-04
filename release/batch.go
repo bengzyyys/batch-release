@@ -28,11 +28,9 @@ type updateDraftPayload struct {
 	Portions int    // 0 表示不改份数
 }
 
-type startBatchPayload struct {
-	BatchNo string
-}
-
-type closeBatchPayload struct {
+// batchTransitionPayload 是批次状态变更（开始执行、关闭）的请求内容，
+// 两项操作都只针对一个批次编号。
+type batchTransitionPayload struct {
 	BatchNo string
 }
 
@@ -158,53 +156,36 @@ func (s *Store) UpdateDraftBatch(reqNo, batchNo, newRecipeNo, newVersion string,
 // StartBatch 开始执行批次：草稿 → 执行中。
 // 开始后计划份数与配方版本固定，只有执行中的批次可以关闭。
 func (s *Store) StartBatch(reqNo, batchNo string) (*BatchView, error) {
-	payload := startBatchPayload{BatchNo: batchNo}
-	var out BatchView
-	err := s.write(reqNo, opStartBatch, payload, func(st *persistedState) (json.RawMessage, error) {
-		b := findBatch(st, batchNo)
-		if b == nil {
-			return nil, fmt.Errorf("%w: 批次 %q", ErrNotFound, batchNo)
-		}
-		if b.Status != StatusDraft {
-			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，只有草稿可以开始执行", ErrInvalidState, batchNo, b.Status)
-		}
-		b.Status = StatusExecuting
-		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
-		if r == nil {
-			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
-				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
-		}
-		view, err := buildBatchView(b, r)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := json.Marshal(view)
-		if err != nil {
-			return nil, err
-		}
-		return raw, nil
-	}, &out)
-	if err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return s.transitionBatch(reqNo, opStartBatch, batchNo,
+		StatusDraft, StatusExecuting, "只有草稿可以开始执行")
 }
 
 // CloseBatch 关闭批次：执行中 → 已关闭。
 // 关闭表示确认已有投料，不要求数量已经吻合；
 // 关闭后不能追加投料，也不能重新打开。
 func (s *Store) CloseBatch(reqNo, batchNo string) (*BatchView, error) {
-	payload := closeBatchPayload{BatchNo: batchNo}
+	return s.transitionBatch(reqNo, opCloseBatch, batchNo,
+		StatusExecuting, StatusClosed, "只有执行中的批次可以关闭")
+}
+
+// transitionBatch 是批次状态变更（开始执行、关闭）的公共处理：
+// 找到批次、确认当前状态允许本次变更、切换到目标状态，再按变更后的
+// 记录构造返回视图。批次不存在返回 ErrNotFound，当前状态不是 from
+// 返回 ErrInvalidState（stateRule 说明该操作要求的来源状态）；拒绝时
+// 批次状态与投料不变，请求编号也不被占用。两项操作共用这一套规则，
+// 保证状态机判断与返回内容始终一致。
+func (s *Store) transitionBatch(reqNo, op, batchNo string, from, to BatchStatus, stateRule string) (*BatchView, error) {
+	payload := batchTransitionPayload{BatchNo: batchNo}
 	var out BatchView
-	err := s.write(reqNo, opCloseBatch, payload, func(st *persistedState) (json.RawMessage, error) {
+	err := s.write(reqNo, op, payload, func(st *persistedState) (json.RawMessage, error) {
 		b := findBatch(st, batchNo)
 		if b == nil {
 			return nil, fmt.Errorf("%w: 批次 %q", ErrNotFound, batchNo)
 		}
-		if b.Status != StatusExecuting {
-			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，只有执行中的批次可以关闭", ErrInvalidState, batchNo, b.Status)
+		if b.Status != from {
+			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，%s", ErrInvalidState, batchNo, b.Status, stateRule)
 		}
-		b.Status = StatusClosed
+		b.Status = to
 		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
 		if r == nil {
 			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
