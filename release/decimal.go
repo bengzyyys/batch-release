@@ -107,9 +107,21 @@ func multiplyPortions(g gramsMilli, portions int) (gramsMilli, error) {
 	if portions <= 0 {
 		return 0, errors.New("份数必须为正整数")
 	}
-	v := int64(g)
-	if v > (1<<63-1)/int64(portions) {
+	if !requiredGramsFits(g, portions) {
 		return 0, fmt.Errorf("数量过大：%s 克 × %d 份溢出", g, portions)
 	}
-	return gramsMilli(v * int64(portions)), nil
+	return gramsMilli(int64(g) * int64(portions)), nil
+}
+
+// requiredGramsFits 判断已保存批次中一种物料的应投量（每份克数 × 计划份数）
+// 是否合法：份数必须为正整数，每份克数必须为正，且乘积不超过
+// maxGramsMilli（9223372036854775.807 克）。克数以千分之一克定点存储，
+// 与整数份数相乘天然精确到千分之一克，不会产生更细的小数位，因此这里
+// 只需防整数溢出：不回绕、不截断、不舍入。恰好等于上限合法。
+// 上限按每种物料分别判断，多种物料的应投量不相加。
+func requiredGramsFits(g gramsMilli, portions int) bool {
+	if portions <= 0 || g <= 0 {
+		return false
+	}
+	return int64(g) <= int64(maxGramsMilli)/int64(portions)
 }
