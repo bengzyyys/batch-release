@@ -279,22 +279,19 @@ func validateState(st *persistedState) error {
 }
 
 // validateBatchPlan 检查一个已保存批次的计划份数与按绑定配方版本算出的
-// 应投量。份数必须为正整数；配方版本 r 的每种物料按其每份克数乘以份数
-// 得到的应投量都必须能以千分之一克精确表示且不超过 maxGramsMilli。
+// 应投量。数量规则本身（正份数、千分之一克精度、逐物料上限）统一由
+// planRequirements 实现，这里只补充“读取已保存批次”场景的错误分类与
+// 批次编号：份数非正或应投量非法都属于 ErrCorruptData。
 // 归属以批次实际绑定的版本为准：换用同编号的其他版本或许能算得通，也
-// 不能作为接受依据。上限逐种物料判断，物料之间不相加；恰好等于上限合法。
-// 计划数量是否合法与投料无关：尚未投料、实投不足或超出应投都不影响。
+// 不能作为接受依据。计划数量是否合法与投料无关：尚未投料、实投不足或
+// 超出应投都不影响。
 func validateBatchPlan(b *batchRecord, r *recipeRecord) error {
 	if b.PlannedPortions <= 0 {
 		return fmt.Errorf("%w: 批次 %q 的计划份数 %d 不是正整数",
 			ErrCorruptData, b.BatchNo, b.PlannedPortions)
 	}
-	for _, m := range r.Materials {
-		if _, err := multiplyPortions(m.GramsMilli, b.PlannedPortions); err != nil {
-			return fmt.Errorf("%w: 批次 %q（计划份数 %d）物料 %q 按绑定配方 %q 版本 %q 的应投量不合法: %v",
-				ErrCorruptData, b.BatchNo, b.PlannedPortions, m.MaterialNo,
-				b.RecipeNo, b.RecipeVersion, err)
-		}
+	if _, err := planRequirements(r, b.PlannedPortions); err != nil {
+		return fmt.Errorf("%w: 批次 %q 的%v", ErrCorruptData, b.BatchNo, err)
 	}
 	return nil
 }
@@ -302,15 +299,12 @@ func validateBatchPlan(b *batchRecord, r *recipeRecord) error {
 // validatePlanForRecipe 校验创建或调整草稿批次时，给定份数按配方版本逐
 // 物料计算的应投量都能精确表示到千分之一克且不超过上限。份数本身的正
 // 整数检查由调用方按各自输入规则完成（调整草稿时份数传 0 表示不改份数，
-// 走到这里的必是最终采用的正份数），这里只判断数量范围。
+// 走到这里的必是最终采用的正份数）；数量规则统一由 planRequirements
+// 实现，这里透传其逐物料说明（物料、配方编号、版本、份数），由调用方
+// 按本次提交包装为 ErrInvalidInput。
 func validatePlanForRecipe(r *recipeRecord, portions int) error {
-	for _, m := range r.Materials {
-		if _, err := multiplyPortions(m.GramsMilli, portions); err != nil {
-			return fmt.Errorf("物料 %q 按配方 %q 版本 %q 以 %d 份计算的应投量不合法: %v",
-				m.MaterialNo, r.RecipeNo, r.Version, portions, err)
-		}
-	}
-	return nil
+	_, err := planRequirements(r, portions)
+	return err
 }
 
 // validateFeedings 检查一个批次内已保存投料的合法性与配方归属。
@@ -506,26 +500,27 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		}
 	}
 
-	// 数量核对按配方物料逐项列出；台账在读取时已通过 validateState 校验，
-	// 这里仍防一手同一版本内物料编号重复，避免返回重复的数量核对项。
-	seen := make(map[string]bool, len(r.Materials))
-	for _, m := range r.Materials {
-		if seen[m.MaterialNo] {
+	// 数量核对按配方物料逐项列出；应投量统一由 planRequirements 按本批次
+	// 绑定版本与计划份数计算，与创建、调整、读取校验共用同一套规则。
+	// 台账在读取时已通过 validateState 校验，这里仍防一手同一版本内物料
+	// 编号重复，避免返回重复的数量核对项。
+	required, err := planRequirements(r, b.PlannedPortions)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 批次 %q 的%v", ErrCorruptData, b.BatchNo, err)
+	}
+	seen := make(map[string]bool, len(required))
+	for _, item := range required {
+		if seen[item.materialNo] {
 			return nil, fmt.Errorf("%w: 配方 %q 版本 %q 的物料编号 %q 重复",
-				ErrCorruptData, r.RecipeNo, r.Version, m.MaterialNo)
+				ErrCorruptData, r.RecipeNo, r.Version, item.materialNo)
 		}
-		seen[m.MaterialNo] = true
-		required, err := multiplyPortions(m.GramsMilli, b.PlannedPortions)
-		if err != nil {
-			return nil, fmt.Errorf("%w: 批次 %q（计划份数 %d）物料 %q 的应投量不合法: %v",
-				ErrCorruptData, b.BatchNo, b.PlannedPortions, m.MaterialNo, err)
-		}
-		act := acc.total(m.MaterialNo)
+		seen[item.materialNo] = true
+		act := acc.total(item.materialNo)
 		v.Materials = append(v.Materials, MaterialRequirement{
-			MaterialNo:      m.MaterialNo,
-			RequiredGrams:   required.String(),
+			MaterialNo:      item.materialNo,
+			RequiredGrams:   item.requiredGrams.String(),
 			ActualGrams:     act.String(),
-			DifferenceGrams: (act - required).String(),
+			DifferenceGrams: (act - item.requiredGrams).String(),
 		})
 	}
 	return v, nil
