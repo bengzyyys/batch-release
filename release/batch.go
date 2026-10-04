@@ -66,9 +66,11 @@ func (s *Store) CreateBatch(reqNo, batchNo, recipeNo, version string, portions i
 		}
 		// 份数为正整数还要满足：按该配方版本逐物料计算的应投量都能精确
 		// 表示且不超上限。这是本次提交的输入规则，不满足按 ErrInvalidInput
-		// 拒绝，不能落盘成之后读取时才发现损坏的批次。
-		if err := validatePlanForRecipe(r, portions); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+		// 拒绝，不能落盘成之后读取时才发现损坏的批次。计算结果同时用于
+		// 构造返回视图，数量规则只经 planRequiredGrams 这一处。
+		required, err := planRequiredGrams(r, portions)
+		if err != nil {
+			return nil, invalidPlanCause(r, err.(*planError))
 		}
 		b := &batchRecord{
 			BatchNo:         batchNo,
@@ -77,7 +79,7 @@ func (s *Store) CreateBatch(reqNo, batchNo, recipeNo, version string, portions i
 			PlannedPortions: portions,
 			Status:          StatusDraft,
 		}
-		view, err := buildBatchView(b, r)
+		view, err := assembleBatchView(b, r, required)
 		if err != nil {
 			return nil, err
 		}
@@ -130,16 +132,18 @@ func (s *Store) UpdateDraftBatch(reqNo, batchNo, newRecipeNo, newVersion string,
 			return nil, fmt.Errorf("%w: 配方 %q 版本 %q 不存在", ErrNotFound, finalRecipeNo, finalVersion)
 		}
 		// 最终计划同样必须满足：每种物料按最终版本、最终份数计算的应投量
-		// 都能精确表示且不超上限；沿用合法原计划（无变化调整）时该校验
-		// 在读取时已经通过，这里再统一校验一次。这是本次提交的输入规则，
-		// 不满足按 ErrInvalidInput 整体拒绝，不落盘份数或配方的半成品。
-		if err := validatePlanForRecipe(r, finalPortions); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+		// 都能精确表示且不超上限；沿用合法原计划（无变化调整）时也统一过
+		// 这同一套规则。这是本次提交的输入规则，不满足按 ErrInvalidInput
+		// 整体拒绝，不落盘份数或配方的半成品。数量判断以这次提交最终采用
+		// 的计划为准，结果同时用于构造返回视图。
+		required, err := planRequiredGrams(r, finalPortions)
+		if err != nil {
+			return nil, invalidPlanCause(r, err.(*planError))
 		}
 		b.PlannedPortions = finalPortions
 		b.RecipeNo = finalRecipeNo
 		b.RecipeVersion = finalVersion
-		view, err := buildBatchView(b, r)
+		view, err := assembleBatchView(b, r, required)
 		if err != nil {
 			return nil, err
 		}

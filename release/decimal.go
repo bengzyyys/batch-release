@@ -101,27 +101,3 @@ func (g gramsMilli) String() string {
 	fs := strings.TrimRight(fmt.Sprintf("%03d", f), "0")
 	return sign + strconv.FormatInt(w, 10) + "." + fs
 }
-
-// multiplyPortions 将每份克数与计划份数相乘，计算某物料的应投量
-// （每份克数 × 计划份数）。读取已保存批次与创建/调整批次时的数量核对
-// 共用这一套规则：
-//   - 计划份数必须为正整数——份数为零或负数的已保存批次即数据损坏，
-//     也不能据此算出零或负的应投量；
-//   - 相乘结果必须能用千分之一克（int64 个 milli）精确表示：克数本身
-//     已是千分之一克的整数倍，整数相乘不引入更小的单位，不存在舍入；
-//     结果超过 maxGramsMilli（9223372036854775.807 克）时返回错误。
-//
-// 上限按每种物料分别判断：只乘该物料自己的每份克数与份数，不与同批次
-// 其他物料的应投量相加；恰好等于上限合法，再大即溢出。计算不回绕、
-// 不截断、不舍入。
-func multiplyPortions(g gramsMilli, portions int) (gramsMilli, error) {
-	if portions <= 0 {
-		return 0, errors.New("份数必须为正整数")
-	}
-	v := int64(g)
-	if v > (1<<63-1)/int64(portions) {
-		return 0, fmt.Errorf("应投量超出上限 %s 克：%s 克 × %d 份无法精确表示",
-			maxGramsMilli, g, portions)
-	}
-	return gramsMilli(v * int64(portions)), nil
-}
