@@ -33,6 +33,9 @@ type Store struct {
 // 任一配方版本的任一物料每份克数不是正数，
 // 任一配方版本内同一物料编号出现多次，
 // 任一批次绑定的配方版本未登记，
+// 任一批次的计划份数不是正整数，或按其绑定的配方版本计算时某物料的
+// 应投量（每份克数 × 计划份数）无法精确表示到千分之一克或超过
+// 9223372036854775.807 克，
 // 任一批次仍为草稿状态却带有投料记录，
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
@@ -161,6 +164,14 @@ func (s *Store) load() error {
 //   - 每个批次记录的配方编号与版本号必须共同指向一个已登记的配方版本。
 //     任一批次找不到对应版本，整份台账即视为损坏——不能改用同编号的其他版本，
 //     也不能按名称或物料内容替换，即使其他批次仍然完整也不能放行本次读取。
+//   - 每个已保存批次的计划份数必须为正整数，且按该批次实际绑定的配方版本
+//     计算，每种物料的应投量（每份克数 × 计划份数）都必须能精确表示到
+//     千分之一克、且不超过 maxGramsMilli（9223372036854775.807 克）。
+//     任一批次份数为零或负数，或任一物料的应投量无法精确表示/超出上限，
+//     整份台账即视为损坏：不区分草稿、执行中还是已关闭，也不取决于本次
+//     查询哪个批次——不能自动减少份数、改选其他配方版本或删除问题批次，
+//     即使其他批次完整也不能放行。上限按每种物料分别判断：多种物料的
+//     应投量相加超过上限不构成非法，单种物料恰好等于上限仍合法。
 //   - 草稿批次不能带有任何投料记录：登记投料只允许操作执行中的批次，
 //     草稿尚未开始执行，出现投料说明保存内容自相矛盾。任一草稿批次包含
 //     至少一条投料，整份台账即视为损坏——即使这些投料的物料都属于绑定
@@ -238,8 +249,46 @@ func validateState(st *persistedState) error {
 			return fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
 				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
 		}
+		if err := validateBatchPlan(b, r); err != nil {
+			return err
+		}
 		if err := validateFeedings(b, r); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateBatchPlan 检查一个已保存批次的计划份数与按绑定配方版本算出的
+// 应投量。份数必须为正整数；配方版本 r 的每种物料按其每份克数乘以份数
+// 得到的应投量都必须能以千分之一克精确表示且不超过 maxGramsMilli。
+// 归属以批次实际绑定的版本为准：换用同编号的其他版本或许能算得通，也
+// 不能作为接受依据。上限逐种物料判断，物料之间不相加；恰好等于上限合法。
+// 计划数量是否合法与投料无关：尚未投料、实投不足或超出应投都不影响。
+func validateBatchPlan(b *batchRecord, r *recipeRecord) error {
+	if b.PlannedPortions <= 0 {
+		return fmt.Errorf("%w: 批次 %q 的计划份数 %d 不是正整数",
+			ErrCorruptData, b.BatchNo, b.PlannedPortions)
+	}
+	for _, m := range r.Materials {
+		if _, err := multiplyPortions(m.GramsMilli, b.PlannedPortions); err != nil {
+			return fmt.Errorf("%w: 批次 %q（计划份数 %d）物料 %q 按绑定配方 %q 版本 %q 的应投量不合法: %v",
+				ErrCorruptData, b.BatchNo, b.PlannedPortions, m.MaterialNo,
+				b.RecipeNo, b.RecipeVersion, err)
+		}
+	}
+	return nil
+}
+
+// validatePlanForRecipe 校验创建或调整草稿批次时，给定份数按配方版本逐
+// 物料计算的应投量都能精确表示到千分之一克且不超过上限。份数本身的正
+// 整数检查由调用方按各自输入规则完成（调整草稿时份数传 0 表示不改份数，
+// 走到这里的必是最终采用的正份数），这里只判断数量范围。
+func validatePlanForRecipe(r *recipeRecord, portions int) error {
+	for _, m := range r.Materials {
+		if _, err := multiplyPortions(m.GramsMilli, portions); err != nil {
+			return fmt.Errorf("物料 %q 按配方 %q 版本 %q 以 %d 份计算的应投量不合法: %v",
+				m.MaterialNo, r.RecipeNo, r.Version, portions, err)
 		}
 	}
 	return nil
@@ -449,7 +498,8 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		seen[m.MaterialNo] = true
 		required, err := multiplyPortions(m.GramsMilli, b.PlannedPortions)
 		if err != nil {
-			return nil, fmt.Errorf("批次 %q 数量核对失败: %w", b.BatchNo, err)
+			return nil, fmt.Errorf("%w: 批次 %q（计划份数 %d）物料 %q 的应投量不合法: %v",
+				ErrCorruptData, b.BatchNo, b.PlannedPortions, m.MaterialNo, err)
 		}
 		act := acc.total(m.MaterialNo)
 		v.Materials = append(v.Materials, MaterialRequirement{

@@ -64,6 +64,12 @@ func (s *Store) CreateBatch(reqNo, batchNo, recipeNo, version string, portions i
 		if r == nil {
 			return nil, fmt.Errorf("%w: 配方 %q 版本 %q 不存在", ErrNotFound, recipeNo, version)
 		}
+		// 份数为正整数还要满足：按该配方版本逐物料计算的应投量都能精确
+		// 表示且不超上限。这是本次提交的输入规则，不满足按 ErrInvalidInput
+		// 拒绝，不能落盘成之后读取时才发现损坏的批次。
+		if err := validatePlanForRecipe(r, portions); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+		}
 		b := &batchRecord{
 			BatchNo:         batchNo,
 			RecipeNo:        recipeNo,
@@ -102,28 +108,37 @@ func (s *Store) UpdateDraftBatch(reqNo, batchNo, newRecipeNo, newVersion string,
 		if b.Status != StatusDraft {
 			return nil, fmt.Errorf("%w: 批次 %q 状态为 %s，只有草稿可以调整", ErrInvalidState, batchNo, b.Status)
 		}
+		// 先解析调整后的最终份数与配方版本（份数传 0 表示沿用原份数，
+		// 配方编号与版本号都留空表示沿用原版本），全部解析并校验通过
+		// 后才改动记录，保证失败时不留下半调整状态。
+		finalPortions := b.PlannedPortions
 		if newPortions != 0 {
 			if newPortions <= 0 {
 				return nil, fmt.Errorf("%w: 计划份数必须为正整数，得到 %d", ErrInvalidInput, newPortions)
 			}
-			b.PlannedPortions = newPortions
+			finalPortions = newPortions
 		}
+		finalRecipeNo, finalVersion := b.RecipeNo, b.RecipeVersion
 		if newRecipeNo != "" || newVersion != "" {
 			if newRecipeNo == "" || newVersion == "" {
 				return nil, fmt.Errorf("%w: 改选配方版本时必须同时给出配方编号和版本号", ErrInvalidInput)
 			}
-			r := findRecipe(st, newRecipeNo, newVersion)
-			if r == nil {
-				return nil, fmt.Errorf("%w: 配方 %q 版本 %q 不存在", ErrNotFound, newRecipeNo, newVersion)
-			}
-			b.RecipeNo = newRecipeNo
-			b.RecipeVersion = newVersion
+			finalRecipeNo, finalVersion = newRecipeNo, newVersion
 		}
-		r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+		r := findRecipe(st, finalRecipeNo, finalVersion)
 		if r == nil {
-			return nil, fmt.Errorf("%w: 批次 %q 绑定的配方 %q 版本 %q 未登记",
-				ErrCorruptData, b.BatchNo, b.RecipeNo, b.RecipeVersion)
+			return nil, fmt.Errorf("%w: 配方 %q 版本 %q 不存在", ErrNotFound, finalRecipeNo, finalVersion)
 		}
+		// 最终计划同样必须满足：每种物料按最终版本、最终份数计算的应投量
+		// 都能精确表示且不超上限；沿用合法原计划（无变化调整）时该校验
+		// 在读取时已经通过，这里再统一校验一次。这是本次提交的输入规则，
+		// 不满足按 ErrInvalidInput 整体拒绝，不落盘份数或配方的半成品。
+		if err := validatePlanForRecipe(r, finalPortions); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+		}
+		b.PlannedPortions = finalPortions
+		b.RecipeNo = finalRecipeNo
+		b.RecipeVersion = finalVersion
 		view, err := buildBatchView(b, r)
 		if err != nil {
 			return nil, err
