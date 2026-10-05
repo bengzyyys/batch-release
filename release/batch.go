@@ -172,6 +172,10 @@ func (s *Store) StartBatch(reqNo, batchNo string) (*BatchView, error) {
 // CloseBatch 关闭批次：执行中 → 已关闭。
 // 关闭表示确认已有投料，不要求数量已经吻合；
 // 关闭后不能追加投料，也不能重新打开。
+// 用同一请求编号、同一批次重复提交时，返回第一次关闭时保存的完整批次
+// 结果；重新读取台账时会核对该保存结果仍与这个已关闭批次的实际内容一致
+// （配方绑定、计划份数、全部投料与逐物料核对），保存结果缺失或被改坏按
+// ErrCorruptData 拒绝，而不是返回残缺结果或重做关闭。
 func (s *Store) CloseBatch(reqNo, batchNo string) (*BatchView, error) {
 	payload := closeBatchPayload{BatchNo: batchNo}
 	var out BatchView

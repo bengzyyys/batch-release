@@ -48,6 +48,51 @@ func (a *feedingAccumulator) total(materialNo string) gramsMilli {
 
 var gramsPattern = regexp.MustCompile(`^(\d+)(?:\.(\d{1,3}))?$`)
 
+// parseGramsSigned 与 parseGrams 使用同样的千分之一克定点规则，但允许
+// 零与负数：读取已保存的关闭结果时，逐物料核对中的累计实投量可以为零
+// （没有投料），实投减应投的差额也可以为负（欠投），真实的零与负差额
+// 都是合法结果，不能当成损坏。无法解析（空串、多于三位小数、非数字）
+// 或超出 int64 表示范围时返回错误。
+func parseGramsSigned(s string) (gramsMilli, error) {
+	s = strings.TrimSpace(s)
+	negative := false
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+		negative = s[0] == '-'
+		s = s[1:]
+	}
+	if s == "" {
+		return 0, errors.New("克数不能为空")
+	}
+	m := gramsPattern.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("克数 %q 不合法：最多三位小数", s)
+	}
+	whole, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("克数 %q 不合法", s)
+	}
+	var frac int64
+	if m[2] != "" {
+		f := m[2]
+		for len(f) < 3 {
+			f += "0"
+		}
+		frac, err = strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("克数 %q 不合法", s)
+		}
+	}
+	if whole > math.MaxInt64/1000 ||
+		(whole == math.MaxInt64/1000 && frac > math.MaxInt64%1000) {
+		return 0, fmt.Errorf("克数 %q 超出可表示范围", s)
+	}
+	milli := whole*1000 + frac
+	if negative {
+		milli = -milli
+	}
+	return gramsMilli(milli), nil
+}
+
 // parseGrams 将克数字符串精确解析为千分之一克。
 // 规则：必须为正数，且最多三位小数（如 100、100.5、0.001 合法；0、-1、1.2345 非法）。
 func parseGrams(s string) (gramsMilli, error) {
