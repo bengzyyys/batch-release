@@ -18,6 +18,22 @@ const (
 	StatusClosed BatchStatus = "closed"
 )
 
+// validBatchStatus 是已保存批次状态允许出现的全部取值，必须精确匹配。
+// 读取台账时状态只能是这三个字符串之一：缺失、为空、null、其他字符串，
+// 或大小写不同、前后多出空格的近似写法都不自动归入某个合法状态。
+var validBatchStatus = map[BatchStatus]bool{
+	StatusDraft:     true,
+	StatusExecuting: true,
+	StatusClosed:    true,
+}
+
+// isValidBatchStatus 判断已保存批次状态是否精确对应一个合法状态。
+// 只做逐字符的精确匹配，不做大小写归一化或去空格："Draft"、" draft "
+// 等写法与 "ready"、空字符串一样属于无法识别的状态。
+func isValidBatchStatus(s BatchStatus) bool {
+	return validBatchStatus[s]
+}
+
 // MaterialInput 是登记配方时的物料输入。
 type MaterialInput struct {
 	// MaterialNo 物料编号，同一配方版本内不可重复。
