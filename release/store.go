@@ -50,6 +50,11 @@ type Store struct {
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
 // 超过 9223372036854775.807 克），
+// 或任一已保存的成功配方登记请求的结果缺失、为 null、为空对象、无法读成
+// 完整配方结果，或原请求登记的版本不存在，或保存结果、原提交内容与实际登记
+// 版本不一致（配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
+// 克数有任何差异；同编号的其他完整版本不能顶替，名称或用量相同也不算同一
+// 版本；每份克数按精确数值核对，1.000 与 1 不算差异），
 // 或任一已保存的成功投料请求的结果缺失、为 null、为空对象，或其登记
 // 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
@@ -246,6 +251,16 @@ func (s *Store) load() error {
 //   - 每条已保存投料的物料编号必须属于该批次绑定的配方版本。归属以批次
 //     实际绑定的版本为准：物料只出现在同编号的其他版本或其他配方中，
 //     不能作为接受依据；也不能改选版本、补入物料或丢弃问题投料后继续。
+//   - 每条已保存的成功请求都必须能重放回它第一次成功时的结果。配方登记
+//     请求的保存结果必须与原提交内容、台账中实际登记的版本三者一致
+//     （配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
+//     克数；克数按精确数值核对，1.000 与 1 是同一用量）；投料请求的保存
+//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容。任一请求
+//     的保存结果缺失、为 null、为空对象、无法解析或对应关系不成立（原请求
+//     登记的版本/批次或序号不存在、内容对不上），整份台账即视为损坏：
+//     不能仅凭保存结果当作登记成功返回，不能用同编号的其他版本或其他批次
+//     的同序号记录顶替，也不能删除请求、补造记录或重新执行原登记。该检查
+//     覆盖所有已保存请求，与本次查询或写入哪条记录无关。
 func validateState(st *persistedState) error {
 	// 先按“配方编号 + 版本号”唯一标识遍历全部配方记录：同组出现第二条
 	// 记录即数据损坏，必须先于一切按标识查找的校验拒绝——否则重复记录
@@ -343,10 +358,13 @@ func validateState(st *persistedState) error {
 			return err
 		}
 	}
-	// 最后核对已保存的成功投料请求：请求记录里保存的返回结果必须能对应到
-	// 原请求批次中同序号的实际投料，并与原提交内容一致。必须先于一切按
-	// 请求编号重放结果的路径判断——否则重放会把与台账实际投料不符的保存
-	// 结果当成第一次成功登记的结果返回。
+	// 最后核对已保存的成功请求：请求记录里保存的返回结果必须是原请求确实
+	// 登记成功的那一次结果。配方登记请求与投料请求分别核对，且都必须先于
+	// 一切按请求编号重放结果的路径判断——否则重放会把与台账实际内容不符的
+	// 保存结果当成第一次成功登记的结果返回。
+	if err := validateRecipeRequests(st); err != nil {
+		return err
+	}
 	if err := validateFeedingRequests(st); err != nil {
 		return err
 	}
@@ -427,6 +445,116 @@ func validateFeedings(b *batchRecord, r *recipeRecord) error {
 		if !acc.add(f.MaterialNo, f.GramsMilli) {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出上限 %s 克",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, maxGramsMilli)
+		}
+	}
+	return nil
+}
+
+// validateRecipeRequests 检查台账中每一条已保存的成功配方登记请求：请求记录
+// 里保存的返回结果，必须是原请求确实登记成功的那个配方版本——原提交内容、
+// 保存的返回结果与台账中的实际登记版本三者必须一致（配方编号、版本号、名称、
+// 物料项数、排列顺序、各项物料编号与每份克数）。本次只核对 registerRecipe
+// 请求，其他操作的保存结果不在此检查。
+//
+// 保存结果缺失、为 null、为空对象、无法读成一份完整的配方结果，原请求对应
+// 的版本在台账中不存在，或三者内容有任何差异，整份台账即视为损坏：不能仅凭
+// 保存结果当作登记成功返回，也不能用同一配方编号下另一个完整版本（R1/v2）
+// 顶替原请求登记的版本（R1/v1）——两个版本名称相同或每份用量相同也不算同一
+// 版本。核对只读取现有记录，绝不删除请求、补造版本或重新登记。
+func validateRecipeRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opRegisterRecipe {
+			continue
+		}
+		if err := validateRecipeRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRecipeRequest 核对一条已保存的成功配方登记请求。对应关系分两层：
+// 保存结果必须与台账中实际登记的版本一致，也必须符合原提交内容（原提交内容
+// 在登记成功时就产生了这个版本，两层一致才说明保存结果、实际版本与原请求
+// 三者仍是同一次登记）。
+//
+// 数量按实际克数核对而非字符串写法：原请求填写 1.000、保存结果显示 1 是
+// 同一次登记的正常写法差异，0.500 与 0.5 同理，不因末尾零不同误报损坏。
+// 这只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交内容
+// 原文比较，把 1.000 改成 1 再提交仍是 ErrRequestConflict。
+func validateRecipeRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload registerRecipePayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		// 提交内容本身已无法解析时无法确定关联版本，错误信息只指明请求编号。
+		return fmt.Errorf("%w: 配方登记请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	// target 用于错误信息：能从原提交内容确定关联版本时一并写明配方编号与版本号。
+	target := fmt.Sprintf("配方 %q 版本 %q", payload.RecipeNo, payload.Version)
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）缺少保存的登记结果",
+			ErrCorruptData, reqNo, target)
+	}
+	var result RecipeView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）保存的登记结果无法解析为完整配方结果",
+			ErrCorruptData, reqNo, target)
+	}
+	// null、空对象或读不出完整配方（编号、版本、名称、物料任一缺失，物料
+	// 为 null/空数组）都不能当作登记成功的结果。
+	if result.RecipeNo == "" || result.Version == "" || result.Name == "" || len(result.Materials) == 0 {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）保存的登记结果缺失或不完整",
+			ErrCorruptData, reqNo, target)
+	}
+	// 原请求登记的版本必须确实存在于台账中：版本不存在（即使同编号另有完整
+	// 的 R1/v2）时，保存结果不能单独作为登记成功的依据，也不能用其他版本顶替。
+	rec := findRecipe(st, payload.RecipeNo, payload.Version)
+	if rec == nil {
+		return fmt.Errorf("%w: 配方登记请求 %q 对应的 %s 未登记，保存的登记结果不能单独作为登记成功的依据",
+			ErrCorruptData, reqNo, target)
+	}
+	// 编号、版本号、名称：保存结果与实际版本、原提交内容三者必须一致。
+	if result.RecipeNo != rec.RecipeNo || result.Version != rec.Version ||
+		result.RecipeNo != payload.RecipeNo || result.Version != payload.Version {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）保存结果的配方编号或版本号与原提交内容及实际登记版本不一致",
+			ErrCorruptData, reqNo, target)
+	}
+	if result.Name != rec.Name || result.Name != payload.Name {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）保存结果的名称与原提交内容或实际登记版本不一致",
+			ErrCorruptData, reqNo, target)
+	}
+	// 物料项数必须一致：多一项、少一项都不是同一次登记（含结果为 null 得到
+	// 的空列表，已在上面的完整性检查中拒绝）。
+	if len(result.Materials) != len(rec.Materials) || len(payload.Materials) != len(rec.Materials) {
+		return fmt.Errorf("%w: 配方登记请求 %q（%s）保存结果或原提交内容的物料项数与实际登记版本不一致",
+			ErrCorruptData, reqNo, target)
+	}
+	// 逐项核对排列顺序、物料编号与每份克数。克数换算成千分之一克后精确比较，
+	// 原提交 1.000、结果显示 1、实际存 1000 milli 是同一用量。
+	for i := range rec.Materials {
+		rm := rec.Materials[i]
+		vm := result.Materials[i]
+		pm := payload.Materials[i]
+		if vm.MaterialNo != rm.MaterialNo || pm.MaterialNo != rm.MaterialNo {
+			return fmt.Errorf("%w: 配方登记请求 %q（%s）第 %d 项物料编号与实际登记版本不一致",
+				ErrCorruptData, reqNo, target, i+1)
+		}
+		resultMilli, err := parseGrams(vm.Grams)
+		if err != nil {
+			return fmt.Errorf("%w: 配方登记请求 %q（%s）保存结果物料 %q 的每份克数 %q 不合法",
+				ErrCorruptData, reqNo, target, rm.MaterialNo, vm.Grams)
+		}
+		payloadMilli, err := parseGrams(pm.Grams)
+		if err != nil {
+			return fmt.Errorf("%w: 配方登记请求 %q（%s）原提交内容物料 %q 的每份克数 %q 不合法",
+				ErrCorruptData, reqNo, target, rm.MaterialNo, pm.Grams)
+		}
+		if resultMilli != rm.GramsMilli || payloadMilli != rm.GramsMilli {
+			return fmt.Errorf("%w: 配方登记请求 %q（%s）物料 %q 的每份克数与实际登记版本不一致",
+				ErrCorruptData, reqNo, target, rm.MaterialNo)
 		}
 	}
 	return nil
@@ -616,9 +744,9 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
-		// 保存的投料结果已在本次 load 的 validateState 中与对应批次的实际
-		// 投料核对一致（缺失、为 null、为空对象或内容不符都已在上面拒绝），
-		// 这里取回的就是第一次成功登记的那条投料。
+		// 保存的配方登记结果与投料结果都已在本次 load 的 validateState 中
+		// 与实际登记内容核对一致（缺失、为 null、为空对象或内容不符都已在
+		// 上面拒绝），这里取回的就是第一次成功登记的结果。
 		if err := json.Unmarshal(req.Result, out); err != nil {
 			return fmt.Errorf("重放请求 %q 的结果失败: %w", reqNo, err)
 		}
