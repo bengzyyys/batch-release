@@ -49,8 +49,14 @@ type Store struct {
 // 未同步序号；不同物料共用批次序号、不同批次各自从 1 开始），
 // 已保存投料的物料编号不属于该批次绑定的配方版本，
 // 或已保存的投料数量非法（单条不是正数，或同一批次同一物料累计实投
-// 超过 9223372036854775.807 克）时，返回 ErrCorruptData（可用 errors.Is
-// 判断），不会当成空台账继续保存，也不会返回可继续使用的台账对象。
+// 超过 9223372036854775.807 克），
+// 或任一已保存的成功投料请求的结果缺失、为 null、为空对象，或其登记
+// 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
+// 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
+// 内容不一致（其他批次的同序号投料不能作为对应记录，原批次不存在时
+// 保存的结果不能单独作为登记成功的依据）时，返回 ErrCorruptData（可用
+// errors.Is 判断），不会当成空台账继续保存，也不会返回可继续使用的
+// 台账对象。
 //
 // dir 可以是相对目录：其位置只按 Open 调用时的工作目录解析一次并固定。
 // 打开之后即使进程切换了工作目录，本对象的查询与保存仍始终指向最初打开
@@ -337,6 +343,13 @@ func validateState(st *persistedState) error {
 			return err
 		}
 	}
+	// 最后核对已保存的成功投料请求：请求记录里保存的返回结果必须能对应到
+	// 原请求批次中同序号的实际投料，并与原提交内容一致。必须先于一切按
+	// 请求编号重放结果的路径判断——否则重放会把与台账实际投料不符的保存
+	// 结果当成第一次成功登记的结果返回。
+	if err := validateFeedingRequests(st); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -415,6 +428,109 @@ func validateFeedings(b *batchRecord, r *recipeRecord) error {
 			return fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出上限 %s 克",
 				ErrCorruptData, b.BatchNo, f.MaterialNo, maxGramsMilli)
 		}
+	}
+	return nil
+}
+
+// validateFeedingRequests 检查台账中每一条已保存的成功投料请求：请求记录里
+// 保存的返回结果，必须对应原请求批次中确实存在的一条实际投料，且与该序号
+// 记录的物料、克数、投料时间、登记人一致，并符合原提交内容。本次只核对
+// 投料（addFeeding）请求，其他操作的保存结果不在此检查。
+//
+// 保存结果缺失、为 null、为空对象，或上述对应关系不成立（批次不存在、
+// 序号在该批次中不存在、内容对不上），整份台账即视为损坏：不能仅凭保存
+// 结果当作登记成功返回——重放取回的结果必须与批次查询显示的实际投料是同
+// 一条。其他批次里同序号的投料不能作为对应记录；物料与数量相同但时间或
+// 登记人不同也不算一致。核对只读取现有记录，绝不删除请求、补造投料或
+// 重新执行原登记。
+func validateFeedingRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opAddFeeding {
+			continue
+		}
+		if err := validateFeedingRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFeedingRequest 核对一条已保存的成功投料请求。对应关系分两层：
+// 保存结果必须与批次中同序号的实际投料一致，也必须符合原提交内容（原
+// 提交内容本身在登记时就来自同一次投料，两层一致才说明保存结果、实际
+// 投料与原请求三者仍是同一次登记）。
+//
+// 数量按实际克数核对而非字符串写法：原请求填写 1.000、保存结果显示 1 是
+// 同一次登记的正常写法差异；时间按同一时刻核对，不区分时区写法。这些
+// 只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交内容
+// 原文比较，把 1.000 改成 1 再提交仍是 ErrRequestConflict。
+func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload addFeedingPayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		return fmt.Errorf("%w: 投料请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	batchNo := payload.BatchNo
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）缺少保存的登记结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	var result FeedingView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存的登记结果无法解析",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原请求对应的批次必须存在：批次都没有了，保存的结果不能单独作为
+	// 登记成功的依据。
+	b := findBatch(st, batchNo)
+	if b == nil {
+		return fmt.Errorf("%w: 投料请求 %q 对应的批次 %q 不存在，保存的登记结果不能单独作为登记成功的依据",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 登记序号必须在原请求对应的批次中确实存在：只在该批次的投料列表里
+	// 找，其他批次里同序号的投料不能作为对应记录。序号为零或负数、超出
+	// 该批次投料条数（含保存结果为 null 或空对象得到的零值）都会在这里
+	// 被拒绝。
+	var rec *feedingRecord
+	for i := range b.Feedings {
+		if b.Feedings[i].Seq == result.Seq {
+			rec = &b.Feedings[i]
+			break
+		}
+	}
+	if rec == nil {
+		return fmt.Errorf("%w: 投料请求 %q 保存结果的登记序号 %d 在批次 %q 中不存在",
+			ErrCorruptData, reqNo, result.Seq, batchNo)
+	}
+	// 克数按实际数值核对：保存结果与原提交内容的写法可以不同（1.000 与 1），
+	// 但换算成实际克数必须一致；无法解析的克数写法本身就是损坏。
+	resultGrams, err := parseGrams(result.Grams)
+	if err != nil {
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存结果的克数 %q 不合法",
+			ErrCorruptData, reqNo, batchNo, result.Grams)
+	}
+	payloadGrams, err := parseGrams(payload.Grams)
+	if err != nil {
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存的提交内容克数 %q 不合法",
+			ErrCorruptData, reqNo, batchNo, payload.Grams)
+	}
+	// 保存结果必须与该序号的实际投料一致：物料编号、实际克数、投料时间
+	// （同一时刻，不区分时区写法）、登记人逐项核对——不能仅凭物料和数量
+	// 相同就忽略时间或登记人的差异。
+	if result.MaterialNo != rec.MaterialNo || resultGrams != rec.GramsMilli ||
+		!result.Time.Equal(rec.Time) || result.Registrar != rec.Registrar {
+		return fmt.Errorf("%w: 投料请求 %q 保存的结果与批次 %q 第 %d 条实际投料不一致（物料、克数、投料时间或登记人不符）",
+			ErrCorruptData, reqNo, batchNo, rec.Seq)
+	}
+	// 保存结果还必须符合原提交内容：同样按物料、实际克数、同一时刻、
+	// 登记人核对。
+	if result.MaterialNo != payload.MaterialNo || resultGrams != payloadGrams ||
+		!result.Time.Equal(payload.Time) || result.Registrar != payload.Registrar {
+		return fmt.Errorf("%w: 投料请求 %q 保存的结果与原提交内容（批次 %q）不一致（物料、克数、投料时间或登记人不符）",
+			ErrCorruptData, reqNo, batchNo)
 	}
 	return nil
 }
@@ -500,6 +616,9 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
+		// 保存的投料结果已在本次 load 的 validateState 中与对应批次的实际
+		// 投料核对一致（缺失、为 null、为空对象或内容不符都已在上面拒绝），
+		// 这里取回的就是第一次成功登记的那条投料。
 		if err := json.Unmarshal(req.Result, out); err != nil {
 			return fmt.Errorf("重放请求 %q 的结果失败: %w", reqNo, err)
 		}
