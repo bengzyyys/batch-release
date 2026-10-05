@@ -86,6 +86,48 @@ func parseGrams(s string) (gramsMilli, error) {
 	return gramsMilli(milli), nil
 }
 
+var signedGramsPattern = regexp.MustCompile(`^(-?)(\d+)(?:\.(\d{1,3}))?$`)
+
+// parseSignedGrams 将允许零与负数的克数字符串精确解析为千分之一克。
+// 用于读取核对中比较应投量、实投量与差额：实投可以为零，差额可以为负，
+// 这些都不是非法数量。规则与 parseGrams 相同（最多三位小数、不超出可
+// 表示范围），只多允许一个前导负号与零值；1.000 与 1 是同一数量。
+func parseSignedGrams(s string) (gramsMilli, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, errors.New("克数不能为空")
+	}
+	m := signedGramsPattern.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("克数 %q 不合法：最多三位小数", s)
+	}
+	whole, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("克数 %q 不合法", s)
+	}
+	var frac int64
+	if m[3] != "" {
+		f := m[3]
+		for len(f) < 3 {
+			f += "0"
+		}
+		frac, err = strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("克数 %q 不合法", s)
+		}
+	}
+	// 与 parseGrams 相同的溢出检查，避免整数回绕。
+	if whole > int64(maxGramsMilli)/1000 ||
+		(whole == int64(maxGramsMilli)/1000 && frac > int64(maxGramsMilli)%1000) {
+		return 0, fmt.Errorf("克数 %q 超出范围：不能超过 %s 克", s, maxGramsMilli)
+	}
+	milli := whole*1000 + frac
+	if m[1] == "-" {
+		milli = -milli
+	}
+	return gramsMilli(milli), nil
+}
+
 // String 将千分之一克格式化为克数字符串，去掉末尾多余的 0。
 func (g gramsMilli) String() string {
 	sign := ""

@@ -59,7 +59,13 @@ type Store struct {
 // 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
 // 内容不一致（其他批次的同序号投料不能作为对应记录，原批次不存在时
-// 保存的结果不能单独作为登记成功的依据）时，返回 ErrCorruptData（可用
+// 保存的结果不能单独作为登记成功的依据），
+// 或任一已保存的成功关闭请求的结果缺失、为 null、为空对象、无法读成
+// 批次结果，或保存结果与原请求所指的已关闭批次不一致（原批次必须存在
+// 并仍为已关闭；结果要对应批次实际绑定的配方编号、版本、名称与计划份数，
+// 保留全部投料及其登记顺序，投料的序号、物料、数量、时间、登记人逐项
+// 一致，逐物料的应投量、实投量与差额与批次相符；另一批次的结果不能顶替，
+// 数量按精确克数核对，时间按同一时刻核对）时，返回 ErrCorruptData（可用
 // errors.Is 判断），不会当成空台账继续保存，也不会返回可继续使用的
 // 台账对象。
 //
@@ -255,8 +261,13 @@ func (s *Store) load() error {
 //     请求的保存结果必须与原提交内容、台账中实际登记的版本三者一致
 //     （配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
 //     克数；克数按精确数值核对，1.000 与 1 是同一用量）；投料请求的保存
-//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容。任一请求
-//     的保存结果缺失、为 null、为空对象、无法解析或对应关系不成立（原请求
+//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容；关闭
+//     请求的保存结果必须是原请求所指批次（必须存在并仍为已关闭）第一次
+//     关闭时确认的完整批次结果——配方绑定、计划份数、全部投料（登记顺序，
+//     序号、物料、数量、时间、登记人逐项一致，不少一条、不多一条、不合并
+//     同物料记录）与逐物料的应投量、实投量、差额都与该批次实际记录相符，
+//     另一批次的结果即使配方与投料数量相同也不能顶替。任一请求的保存结果
+//     缺失、为 null、为空对象、无法解析或对应关系不成立（原请求
 //     登记的版本/批次或序号不存在、内容对不上），整份台账即视为损坏：
 //     不能仅凭保存结果当作登记成功返回，不能用同编号的其他版本或其他批次
 //     的同序号记录顶替，也不能删除请求、补造记录或重新执行原登记。该检查
@@ -366,6 +377,9 @@ func validateState(st *persistedState) error {
 		return err
 	}
 	if err := validateFeedingRequests(st); err != nil {
+		return err
+	}
+	if err := validateCloseBatchRequests(st); err != nil {
 		return err
 	}
 	return nil
@@ -663,6 +677,175 @@ func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord
 	return nil
 }
 
+// validateCloseBatchRequests 检查台账中每一条已保存的成功关闭请求：请求记录里
+// 保存的返回结果，必须是原请求所指批次第一次关闭时确认的那份完整批次结果——
+// 原请求所指的批次必须存在并仍为已关闭，保存结果要对应这个批次实际绑定的配方
+// 编号、版本、名称和计划份数，保留全部投料及其登记顺序，逐物料的应投量、实投
+// 量和差额也要与该批次相符。本次只核对关闭（closeBatch）请求，其他操作的保存
+// 结果不在此检查。
+//
+// 保存结果缺失、为 null、为空对象、无法读成批次结果，或上述对应关系不成立
+// （批次不存在或不再是已关闭、批次编号对不上、配方绑定或份数不符、投料少一条/
+// 多一条/被合并/顺序或内容有差异、核对项的应投量/实投量/差额对不上），整份台账
+// 即视为损坏：不能仅凭保存结果当作关闭成功返回，不能用另一批次的结果顶替
+// （哪怕配方与投料数量相同），也不能删除请求、重做关闭或用当前查询结果覆盖
+// 损坏结果。该检查覆盖所有已保存的关闭请求，与本次访问哪个批次无关。
+func validateCloseBatchRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opCloseBatch {
+			continue
+		}
+		if err := validateCloseBatchRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCloseBatchRequest 核对一条已保存的成功关闭请求。对应关系：保存结果
+// 必须是原请求所指批次（提交内容中的批次编号）当前已关闭状态的完整视图——
+// 批次存在且仍为已关闭，结果中的批次编号、配方绑定、计划份数、状态、全部
+// 投料（登记顺序）与逐物料数量核对都与该批次的实际记录一致。
+//
+// 数量按精确克数核对而非字符串写法：保存结果显示 1、批次记录为 1.000 是同一
+// 数量的正常写法差异；时间按同一时刻核对，不区分时区写法。关闭只确认已有
+// 投料、不要求数量吻合，因此没有投料、实投为零或差额为负都是合法内容，
+// 不能当成损坏。
+func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload closeBatchPayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		// 提交内容本身已无法解析时无法确定关联批次，错误信息只指明请求编号。
+		return fmt.Errorf("%w: 关闭请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	batchNo := payload.BatchNo
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）缺少保存的关闭结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	var result BatchView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存的关闭结果无法解析为完整批次结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// null、空对象或读不出批次编号的结果都不能当作关闭成功的结果。
+	if result.BatchNo == "" {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存的关闭结果缺失或不完整",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原请求所指的批次必须存在并仍为已关闭：批次没有了，或已被改回其他
+	// 状态，保存的结果都不能单独作为关闭成功的依据。
+	b := findBatch(st, batchNo)
+	if b == nil {
+		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 不存在，保存的关闭结果不能单独作为关闭成功的依据",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	if b.Status != StatusClosed {
+		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 当前状态为 %s，不是已关闭，保存的关闭结果与已确认记录不一致",
+			ErrCorruptData, reqNo, batchNo, b.Status)
+	}
+	// 保存结果必须指向原请求的批次：另一批次的结果即使配方与投料数量
+	// 完全相同，也不能顶替。
+	if result.BatchNo != batchNo {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
+			ErrCorruptData, reqNo, batchNo, result.BatchNo)
+	}
+	// 配方绑定与计划份数必须对应该批次实际绑定的版本与份数。批次已在
+	// 前面的校验中确认绑定的配方版本存在，这里仍防一手。
+	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+	if r == nil {
+		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 绑定的配方 %q 版本 %q 未登记",
+			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.RecipeNo != b.RecipeNo || result.RecipeVersion != b.RecipeVersion ||
+		result.RecipeName != r.Name {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的配方编号、版本或名称与批次实际绑定的配方 %q 版本 %q 不一致",
+			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.PlannedPortions != b.PlannedPortions {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的计划份数 %d 与批次实际份数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, b.PlannedPortions)
+	}
+	// 关闭结果确认的就是已关闭状态：状态被改成其他值即与已确认记录不一致。
+	if result.Status != StatusClosed {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的状态为 %q，不是已关闭",
+			ErrCorruptData, reqNo, batchNo, result.Status)
+	}
+	// 投料必须一条不多、一条不少地按登记顺序保留：同物料的多次投料不能
+	// 合并，序号、物料、数量、时间与登记人逐项核对。数量按精确克数比较
+	// （1.000 与 1 是同一数量），时间按同一时刻比较（不区分时区写法）。
+	if len(result.Feedings) != len(b.Feedings) {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的投料条数 %d 与批次实际投料条数 %d 不一致，不能少一条、多一条或合并同物料的记录",
+			ErrCorruptData, reqNo, batchNo, len(result.Feedings), len(b.Feedings))
+	}
+	for i := range b.Feedings {
+		rec := b.Feedings[i]
+		fv := result.Feedings[i]
+		fg, err := parseGrams(fv.Grams)
+		if err != nil {
+			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料的克数 %q 不合法",
+				ErrCorruptData, reqNo, batchNo, i+1, fv.Grams)
+		}
+		if fv.Seq != rec.Seq || fv.MaterialNo != rec.MaterialNo || fg != rec.GramsMilli ||
+			!fv.Time.Equal(rec.Time) || fv.Registrar != rec.Registrar {
+			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料与批次实际投料不一致（序号、物料、克数、投料时间或登记人不符）",
+				ErrCorruptData, reqNo, batchNo, i+1)
+		}
+	}
+	// 逐物料的数量核对也必须与该批次相符：应投量按批次实际绑定的配方
+	// 版本与计划份数计算，实投量按实际投料累计，差额为实投减应投。只改
+	// 坏核对差额、原始投料仍完整，同样属于结果与已确认记录不一致。真实
+	// 的零实投与负差额是合法内容，按精确克数核对即可，不会误报。
+	required, err := planRequirements(r, b.PlannedPortions)
+	if err != nil {
+		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 的%v",
+			ErrCorruptData, reqNo, batchNo, err)
+	}
+	acc := newFeedingAccumulator()
+	for _, f := range b.Feedings {
+		if !acc.add(f.MaterialNo, f.GramsMilli) {
+			return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 物料 %q 的累计实投超出可表示范围",
+				ErrCorruptData, reqNo, batchNo, f.MaterialNo)
+		}
+	}
+	if len(result.Materials) != len(required) {
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的物料核对项数 %d 与批次实际核对项数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
+	}
+	for i, item := range required {
+		rm := result.Materials[i]
+		if rm.MaterialNo != item.materialNo {
+			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与批次实际核对物料 %q 不一致",
+				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
+		}
+		actual := acc.total(item.materialNo)
+		diff := actual - item.requiredGrams
+		for _, check := range []struct {
+			name string
+			got  string
+			want gramsMilli
+		}{
+			{"应投量", rm.RequiredGrams, item.requiredGrams},
+			{"实投量", rm.ActualGrams, actual},
+			{"差额", rm.DifferenceGrams, diff},
+		} {
+			got, err := parseSignedGrams(check.got)
+			if err != nil {
+				return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
+			}
+			if got != check.want {
+				return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果物料 %q 的%s %s 与批次实际值 %s 不一致",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
+			}
+		}
+	}
+	return nil
+}
+
 // persist 先写临时文件再原子改名，并 fsync 目录，保证已提交数据可恢复。
 func (s *Store) persist(st *persistedState) error {
 	data, err := json.MarshalIndent(st, "", "  ")
@@ -744,9 +927,9 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
-		// 保存的配方登记结果与投料结果都已在本次 load 的 validateState 中
-		// 与实际登记内容核对一致（缺失、为 null、为空对象或内容不符都已在
-		// 上面拒绝），这里取回的就是第一次成功登记的结果。
+		// 保存的配方登记结果、投料结果与关闭结果都已在本次 load 的
+		// validateState 中与实际登记内容核对一致（缺失、为 null、为空对象
+		// 或内容不符都已在上面拒绝），这里取回的就是第一次成功的结果。
 		if err := json.Unmarshal(req.Result, out); err != nil {
 			return fmt.Errorf("重放请求 %q 的结果失败: %w", reqNo, err)
 		}
