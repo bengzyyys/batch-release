@@ -222,6 +222,10 @@ func transitionBatchStatus(st *persistedState, batchNo string, from, to BatchSta
 // 9223372036854775.807 克，本次投料后恰好等于上限仍允许，超过则返回
 // ErrInvalidInput 且不保存本次投料。
 // 投料按成功登记的先后顺序编号，不按投料时间重排。
+// 用原请求编号与原内容重复提交时，返回的始终是第一次登记成功的那条投料
+// （按台账中的实际记录构造，而不是可能已被改写的保存结果），不重复追加；
+// 若保存的请求结果已无法对应到原批次中的真实投料，则按 ErrCorruptData
+// 拒绝整份台账。
 func (s *Store) AddFeeding(reqNo, batchNo, materialNo, grams string, t time.Time, registrar string) (*FeedingView, error) {
 	payload := addFeedingPayload{
 		BatchNo:    batchNo,
