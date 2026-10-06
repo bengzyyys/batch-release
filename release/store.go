@@ -60,6 +60,13 @@ type Store struct {
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
 // 内容不一致（其他批次的同序号投料不能作为对应记录，原批次不存在时
 // 保存的结果不能单独作为登记成功的依据），
+// 或任一已保存的成功开始执行请求的结果缺失、为 null、为空对象、无法读成
+// 批次结果，或保存结果与原请求所指批次第一次开始执行时的内容不一致（原
+// 批次必须存在且当前为执行中或已关闭；结果要对应批次开始时确定的配方
+// 编号、版本、名称与计划份数，状态为执行中，投料列表为空，各物料按绑定
+// 配方的顺序完整列出，应投量为每份克数 × 计划份数、实投量为零、差额为
+// 应投量的负值；另一批次的结果不能顶替，批次后来的投料与关闭不能混入，
+// 数量按精确克数核对），
 // 或任一已保存的成功关闭请求的结果缺失、为 null、为空对象、无法读成
 // 批次结果，或保存结果与原请求所指的已关闭批次不一致（原批次必须存在
 // 并仍为已关闭；结果要对应批次实际绑定的配方编号、版本、名称与计划份数，
@@ -261,12 +268,16 @@ func (s *Store) load() error {
 //     请求的保存结果必须与原提交内容、台账中实际登记的版本三者一致
 //     （配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
 //     克数；克数按精确数值核对，1.000 与 1 是同一用量）；投料请求的保存
-//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容；关闭
-//     请求的保存结果必须是原请求所指批次（必须存在并仍为已关闭）第一次
-//     关闭时确认的完整批次结果——配方绑定、计划份数、全部投料（登记顺序，
-//     序号、物料、数量、时间、登记人逐项一致，不少一条、不多一条、不合并
-//     同物料记录）与逐物料的应投量、实投量、差额都与该批次实际记录相符，
-//     另一批次的结果即使配方与投料数量相同也不能顶替。任一请求的保存结果
+//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容；开始
+//     执行请求的保存结果必须是原请求所指批次（必须存在且当前为执行中
+//     或已关闭）第一次开始执行时的批次结果——批次开始时确定的配方绑定
+//     与计划份数、执行中状态、空投料列表，以及逐物料应投量 = 每份克数 ×
+//     计划份数、实投量为零、差额为应投量的负值，批次后来的投料与关闭
+//     不能混入；关闭请求的保存结果必须是原请求所指批次（必须存在并仍为
+//     已关闭）第一次关闭时确认的完整批次结果——配方绑定、计划份数、全部
+//     投料（登记顺序，序号、物料、数量、时间、登记人逐项一致，不少一条、
+//     不多一条、不合并同物料记录）与逐物料的应投量、实投量、差额都与该
+//     批次实际记录相符，另一批次的结果即使配方与投料数量相同也不能顶替。任一请求的保存结果
 //     缺失、为 null、为空对象、无法解析或对应关系不成立（原请求
 //     登记的版本/批次或序号不存在、内容对不上），整份台账即视为损坏：
 //     不能仅凭保存结果当作登记成功返回，不能用同编号的其他版本或其他批次
@@ -377,6 +388,9 @@ func validateState(st *persistedState) error {
 		return err
 	}
 	if err := validateFeedingRequests(st); err != nil {
+		return err
+	}
+	if err := validateStartBatchRequests(st); err != nil {
 		return err
 	}
 	if err := validateCloseBatchRequests(st); err != nil {
@@ -677,6 +691,162 @@ func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord
 	return nil
 }
 
+// validateStartBatchRequests 检查台账中每一条已保存的成功开始执行请求：请求
+// 记录里保存的返回结果，必须是原请求所指批次第一次开始执行时的那份批次结果——
+// 原请求所指的批次必须存在且当前为执行中或已关闭，保存结果要对应这个批次开始
+// 时确定的配方编号、版本、名称和计划份数，状态为执行中，投料列表为空，各物料
+// 按绑定配方的顺序完整列出，应投量为每份克数 × 计划份数、实投量为零、差额为
+// 应投量的负值。本次只核对开始执行（startBatch）请求，其他操作的保存结果不在
+// 此检查。
+//
+// 保存结果缺失、为 null、为空对象、无法读成批次结果，或上述对应关系不成立
+// （批次不存在或已退回草稿、批次编号对不上、配方绑定或份数不符、状态不是
+// 执行中、混入了后来追加的投料或关闭后的现状、核对项的应投量/实投量/差额
+// 对不上），整份台账即视为损坏：不能仅凭保存结果当作开始成功返回，不能用
+// 内容相同的另一批次的结果顶替，也不能删除请求、补造批次或用当前查询结果
+// 覆盖损坏结果。该检查覆盖所有已保存的开始执行请求，与本次访问哪个批次无关。
+func validateStartBatchRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opStartBatch {
+			continue
+		}
+		if err := validateStartBatchRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateStartBatchRequest 核对一条已保存的成功开始执行请求。对应关系：保存
+// 结果必须是原请求所指批次（提交内容中的批次编号）第一次开始执行时的视图——
+// 批次存在且当前为执行中或已关闭（开始执行只会从草稿前进，不会退回草稿），
+// 结果中的批次编号、配方绑定、计划份数与该批次开始时确定的实际记录一致，
+// 状态为执行中、投料列表为空、逐物料应投量 = 每份克数 × 计划份数、实投量为
+// 零、差额为应投量的负值。
+//
+// 批次后来的投料与关闭属于批次现状，不属于第一次开始的结果：保存结果里混入
+// 这些内容即与首次开始记录不一致；反过来，批次当前已投料或已关闭也不能成为
+// 拒绝一份合法首次开始结果的理由——核对始终以“开始那一刻”的内容为准。
+//
+// 数量按精确克数核对而非字符串写法：保存结果显示 1、应投量显示 1.000 是同一
+// 数量；实投 0 与 0.000 相同，合法的负差额不误报。草稿开始前调整过计划的，
+// 以批次记录中最终选定的配方版本与份数为准——开始执行后两者已固定，批次
+// 记录就是首次开始时的计划。
+func validateStartBatchRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload startBatchPayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		// 提交内容本身已无法解析时无法确定关联批次，错误信息只指明请求编号。
+		return fmt.Errorf("%w: 开始执行请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	batchNo := payload.BatchNo
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）缺少保存的开始结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	var result BatchView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存的开始结果无法解析为完整批次结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// null、空对象或读不出批次编号的结果都不能当作开始成功的结果。
+	if result.BatchNo == "" {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存的开始结果缺失或不完整",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原请求所指的批次必须存在：批次没有了，保存的结果不能单独作为开始
+	// 成功的依据。
+	b := findBatch(st, batchNo)
+	if b == nil {
+		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 不存在，保存的开始结果不能单独作为开始成功的依据",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 批次当前只能是执行中或已关闭：开始执行后状态只会前进，若被改回草稿，
+	// 保存的开始结果与已确认记录不再一致。
+	if b.Status != StatusExecuting && b.Status != StatusClosed {
+		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 当前状态为 %s，不是执行中或已关闭，保存的开始结果与已确认记录不一致",
+			ErrCorruptData, reqNo, batchNo, b.Status)
+	}
+	// 保存结果必须指向原请求的批次：内容相同的另一批次的结果不能顶替。
+	if result.BatchNo != batchNo {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
+			ErrCorruptData, reqNo, batchNo, result.BatchNo)
+	}
+	// 配方绑定与计划份数必须对应批次开始时确定的版本与份数。开始执行后
+	// 两者固定，批次当前记录即首次开始时的计划；草稿阶段调整过计划的，
+	// 以这份最终选定为准。批次已在前面的校验中确认绑定的配方版本存在，
+	// 这里仍防一手。
+	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+	if r == nil {
+		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 绑定的配方 %q 版本 %q 未登记",
+			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.RecipeNo != b.RecipeNo || result.RecipeVersion != b.RecipeVersion ||
+		result.RecipeName != r.Name {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的配方编号、版本或名称与批次开始时确定的配方 %q 版本 %q 不一致",
+			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.PlannedPortions != b.PlannedPortions {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的计划份数 %d 与批次开始时确定的份数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, b.PlannedPortions)
+	}
+	// 首次开始的结果状态必须是执行中：被改成关闭后的现状或其他值，即与
+	// 首次开始记录不一致。
+	if result.Status != StatusExecuting {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的状态为 %q，不是执行中",
+			ErrCorruptData, reqNo, batchNo, result.Status)
+	}
+	// 首次开始时不存在任何投料：保存结果里出现投料，说明混入了批次后来
+	// 的现状，与首次开始记录不一致。
+	if len(result.Feedings) != 0 {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果包含 %d 条投料，首次开始时的投料列表应为空，不能混入后来追加的投料",
+			ErrCorruptData, reqNo, batchNo, len(result.Feedings))
+	}
+	// 逐物料的数量核对必须与首次开始时相符：应投量按批次绑定的配方版本
+	// 与计划份数计算，实投量为零，差额为应投量的负值。物料按绑定配方的
+	// 顺序完整列出，一项不多、一项不少。真实的零实投与负差额是合法内容，
+	// 按精确克数核对即可，不会误报。
+	required, err := planRequirements(r, b.PlannedPortions)
+	if err != nil {
+		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 的%v",
+			ErrCorruptData, reqNo, batchNo, err)
+	}
+	if len(result.Materials) != len(required) {
+		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的物料核对项数 %d 与批次实际核对项数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
+	}
+	for i, item := range required {
+		rm := result.Materials[i]
+		if rm.MaterialNo != item.materialNo {
+			return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与批次实际核对物料 %q 不一致",
+				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
+		}
+		for _, check := range []struct {
+			name string
+			got  string
+			want gramsMilli
+		}{
+			{"应投量", rm.RequiredGrams, item.requiredGrams},
+			{"实投量", rm.ActualGrams, 0},
+			{"差额", rm.DifferenceGrams, -item.requiredGrams},
+		} {
+			got, err := parseSignedGrams(check.got)
+			if err != nil {
+				return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
+			}
+			if got != check.want {
+				return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果物料 %q 的%s %s 与首次开始时的值 %s 不一致",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
+			}
+		}
+	}
+	return nil
+}
+
 // validateCloseBatchRequests 检查台账中每一条已保存的成功关闭请求：请求记录里
 // 保存的返回结果，必须是原请求所指批次第一次关闭时确认的那份完整批次结果——
 // 原请求所指的批次必须存在并仍为已关闭，保存结果要对应这个批次实际绑定的配方
@@ -927,9 +1097,10 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
-		// 保存的配方登记结果、投料结果与关闭结果都已在本次 load 的
-		// validateState 中与实际登记内容核对一致（缺失、为 null、为空对象
-		// 或内容不符都已在上面拒绝），这里取回的就是第一次成功的结果。
+		// 保存的配方登记结果、投料结果、开始执行结果与关闭结果都已在本次
+		// load 的 validateState 中与实际登记内容核对一致（缺失、为 null、
+		// 为空对象或内容不符都已在上面拒绝），这里取回的就是第一次成功的
+		// 结果。
 		if err := json.Unmarshal(req.Result, out); err != nil {
 			return fmt.Errorf("重放请求 %q 的结果失败: %w", reqNo, err)
 		}
