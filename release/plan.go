@@ -39,3 +39,56 @@ func planRequirements(r *recipeRecord, portions int) ([]plannedMaterial, error) 
 	}
 	return out, nil
 }
+
+// validateUnfedResultMaterials 是“尚未投料的批次结果”数量核对的唯一实现：
+// 首次创建、草稿调整与首次开始执行成功时，批次都还没有任何投料，三类保存
+// 结果的数量核对遵循同一套规则——物料按结果依据的配方版本顺序完整列出，
+// 每种物料恰有一项，应投量等于计划应投量（每份克数 × 当时份数，由调用方
+// 按各自依据确定版本与份数后经 planRequirements 算出，通过 required 传入），
+// 实投量为零，差额为应投量的负值。
+//
+// 结果依据的配方版本与份数不由本函数判断：创建取原提交内容选定的版本与
+// 份数，草稿调整取结果实际采用的版本与份数（沿用值也在结果中），开始执行
+// 取批次最终固定的记录——各调用方确定后把算好的 required 交给这里统一核对。
+// 这里只负责核对保存结果与这组应有数量是否一致：一项不多、一项不少，不能
+// 遗漏、重复、调换顺序或混入其他版本的物料。数量按精确克数核对而非字符串
+// 写法：1 与 1.000、0 与 0.000、-1 与 -1.000 分别相同，合法的零实投与负
+// 差额不是损坏；无法解析或与应有值不符的数量都是数据损坏。
+//
+// opDesc 是操作类别（如 "创建批次请求"），与 reqNo、batchNo 一起写入错误
+// 信息；能确定问题物料时一并写明物料编号与数量原因。
+func validateUnfedResultMaterials(opDesc, reqNo, batchNo string, required []plannedMaterial, got []MaterialRequirement) error {
+	if len(got) != len(required) {
+		return fmt.Errorf("%w: %s %q（批次 %q）保存结果的物料核对项数 %d 与应有项数 %d 不一致，不能遗漏、重复或混入其他版本的物料",
+			ErrCorruptData, opDesc, reqNo, batchNo, len(got), len(required))
+	}
+	for i, item := range required {
+		rm := got[i]
+		if rm.MaterialNo != item.materialNo {
+			return fmt.Errorf("%w: %s %q（批次 %q）保存结果第 %d 项核对物料 %q 与应有物料 %q 不一致（顺序被调换、遗漏或混入其他版本物料）",
+				ErrCorruptData, opDesc, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
+		}
+		// 应投量取计划值，实投量必为零，差额必为应投量的负值：尚未投料的
+		// 结果里，真实的零实投与负差额是合法内容，按精确克数核对即可。
+		for _, check := range []struct {
+			name string
+			got  string
+			want gramsMilli
+		}{
+			{"应投量", rm.RequiredGrams, item.requiredGrams},
+			{"实投量", rm.ActualGrams, 0},
+			{"差额", rm.DifferenceGrams, -item.requiredGrams},
+		} {
+			gotVal, err := parseSignedGrams(check.got)
+			if err != nil {
+				return fmt.Errorf("%w: %s %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
+					ErrCorruptData, opDesc, reqNo, batchNo, item.materialNo, check.name, check.got)
+			}
+			if gotVal != check.want {
+				return fmt.Errorf("%w: %s %q（批次 %q）保存结果物料 %q 的%s %s 与应有值 %s 不一致",
+					ErrCorruptData, opDesc, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
+			}
+		}
+	}
+	return nil
+}

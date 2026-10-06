@@ -746,45 +746,17 @@ func validateCreateBatchRequest(st *persistedState, reqNo string, req *requestRe
 			ErrCorruptData, reqNo, batchNo, len(result.Feedings))
 	}
 	// 逐物料的数量核对必须与首次创建时相符：应投量按原选配方版本的每份
-	// 克数 × 创建时份数计算，实投量为零，差额为应投量的负值。物料按原选
-	// 版本的顺序完整列出，一项不多、一项不少。真实的零实投与负差额是合法
-	// 内容，按精确克数核对即可，不会误报。
+	// 克数 × 创建时份数计算，实投量为零，差额为应投量的负值。创建结果的
+	// 依据是原提交内容选定的版本与份数，这里据此算出应有数量；份数或
+	// 应投量本身不合法，说明保存的提交内容不符合创建要求。算出应有数量
+	// 后的逐项核对（顺序完整、零实投、负差额）与草稿调整、首次开始执行
+	// 共用 validateUnfedResultMaterials 这一套实现。
 	required, err := planRequirements(r, payload.Portions)
 	if err != nil {
 		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存的提交内容不符合创建要求：%v",
 			ErrCorruptData, reqNo, batchNo, err)
 	}
-	if len(result.Materials) != len(required) {
-		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的物料核对项数 %d 与原选版本的物料项数 %d 不一致",
-			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
-	}
-	for i, item := range required {
-		rm := result.Materials[i]
-		if rm.MaterialNo != item.materialNo {
-			return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与原选版本的物料 %q 不一致",
-				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
-		}
-		for _, check := range []struct {
-			name string
-			got  string
-			want gramsMilli
-		}{
-			{"应投量", rm.RequiredGrams, item.requiredGrams},
-			{"实投量", rm.ActualGrams, 0},
-			{"差额", rm.DifferenceGrams, -item.requiredGrams},
-		} {
-			got, err := parseSignedGrams(check.got)
-			if err != nil {
-				return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
-			}
-			if got != check.want {
-				return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果物料 %q 的%s %s 与首次创建时的值 %s 不一致",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
-			}
-		}
-	}
-	return nil
+	return validateUnfedResultMaterials("创建批次请求", reqNo, batchNo, required, result.Materials)
 }
 
 // validateUpdateDraftRequests 检查台账中每一条已保存的成功草稿调整请求：请求
@@ -934,46 +906,17 @@ func validateUpdateDraftRequest(st *persistedState, reqNo string, req *requestRe
 		}
 	}
 	// 逐物料的数量核对以结果实际采用的配方版本与计划份数为准：应投量按该
-	// 版本每份克数 × 份数计算，实投量为零，差额为应投量的负值。物料按该
-	// 版本顺序完整列出，一项不多、一项不少，不能遗漏、重复或混入其他版本
-	// 的物料。应投量继续遵守现有精度与逐物料上限。真实的零实投与负差额是
-	// 合法内容，按精确克数核对即可，不会误报。
+	// 版本每份克数 × 份数计算，实投量为零，差额为应投量的负值，应投量继续
+	// 遵守现有精度与逐物料上限。调整结果的依据是结果采用的版本与份数
+	// （沿用值也体现在结果字段中，不拿批次当前计划代替），这里据此算出
+	// 应有数量；算出后的逐项核对（顺序完整、零实投、负差额）与首次创建、
+	// 首次开始执行共用 validateUnfedResultMaterials 这一套实现。
 	required, err := planRequirements(r, result.PlannedPortions)
 	if err != nil {
 		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的%v",
 			ErrCorruptData, reqNo, batchNo, err)
 	}
-	if len(result.Materials) != len(required) {
-		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的物料核对项数 %d 与其采用配方版本的物料项数 %d 不一致，不能遗漏或混入其他版本的物料",
-			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
-	}
-	for i, item := range required {
-		rm := result.Materials[i]
-		if rm.MaterialNo != item.materialNo {
-			return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与其采用版本的物料 %q 不一致（顺序、遗漏或混入其他版本物料）",
-				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
-		}
-		for _, check := range []struct {
-			name string
-			got  string
-			want gramsMilli
-		}{
-			{"应投量", rm.RequiredGrams, item.requiredGrams},
-			{"实投量", rm.ActualGrams, 0},
-			{"差额", rm.DifferenceGrams, -item.requiredGrams},
-		} {
-			got, err := parseSignedGrams(check.got)
-			if err != nil {
-				return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
-			}
-			if got != check.want {
-				return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果物料 %q 的%s %s 与调整成功时的值 %s 不一致",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
-			}
-		}
-	}
-	return nil
+	return validateUnfedResultMaterials("草稿调整请求", reqNo, batchNo, required, result.Materials)
 }
 
 // validateFeedingRequests 检查台账中每一条已保存的成功投料请求：请求记录里
@@ -1194,45 +1137,16 @@ func validateStartBatchRequest(st *persistedState, reqNo string, req *requestRec
 			ErrCorruptData, reqNo, batchNo, len(result.Feedings))
 	}
 	// 逐物料的数量核对必须与首次开始时相符：应投量按批次绑定的配方版本
-	// 与计划份数计算，实投量为零，差额为应投量的负值。物料按绑定配方的
-	// 顺序完整列出，一项不多、一项不少。真实的零实投与负差额是合法内容，
-	// 按精确克数核对即可，不会误报。
+	// 与计划份数计算，实投量为零，差额为应投量的负值。开始结果的依据是
+	// 批次开始时最终固定的版本与份数（即批次当前记录），这里据此算出
+	// 应有数量；算出后的逐项核对（顺序完整、零实投、负差额）与首次创建、
+	// 草稿调整共用 validateUnfedResultMaterials 这一套实现。
 	required, err := planRequirements(r, b.PlannedPortions)
 	if err != nil {
 		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 的%v",
 			ErrCorruptData, reqNo, batchNo, err)
 	}
-	if len(result.Materials) != len(required) {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的物料核对项数 %d 与批次实际核对项数 %d 不一致",
-			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
-	}
-	for i, item := range required {
-		rm := result.Materials[i]
-		if rm.MaterialNo != item.materialNo {
-			return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与批次实际核对物料 %q 不一致",
-				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
-		}
-		for _, check := range []struct {
-			name string
-			got  string
-			want gramsMilli
-		}{
-			{"应投量", rm.RequiredGrams, item.requiredGrams},
-			{"实投量", rm.ActualGrams, 0},
-			{"差额", rm.DifferenceGrams, -item.requiredGrams},
-		} {
-			got, err := parseSignedGrams(check.got)
-			if err != nil {
-				return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
-			}
-			if got != check.want {
-				return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果物料 %q 的%s %s 与首次开始时的值 %s 不一致",
-					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
-			}
-		}
-	}
-	return nil
+	return validateUnfedResultMaterials("开始执行请求", reqNo, batchNo, required, result.Materials)
 }
 
 // validateCloseBatchRequests 检查台账中每一条已保存的成功关闭请求：请求记录里
