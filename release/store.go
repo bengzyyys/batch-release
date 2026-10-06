@@ -965,9 +965,11 @@ func validateFeedingRequests(st *persistedState) error {
 // 投料与原请求三者仍是同一次登记）。
 //
 // 数量按实际克数核对而非字符串写法：原请求填写 1.000、保存结果显示 1 是
-// 同一次登记的正常写法差异；时间按同一时刻核对，不区分时区写法。这些
-// 只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交内容
-// 原文比较，把 1.000 改成 1 再提交仍是 ErrRequestConflict。
+// 同一次登记的正常写法差异；时间按同一时刻核对，不区分时区写法。投料内容
+// 的判断标准（物料编号与登记人精确匹配、克数比较实际数量、时间比较同一
+// 时刻）统一由 feedingContent 实现，与关闭结果中投料的核对共用同一处。
+// 这些只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交
+// 内容原文比较，把 1.000 改成 1 再提交仍是 ErrRequestConflict。
 func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord) error {
 	var payload addFeedingPayload
 	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
@@ -1007,29 +1009,30 @@ func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord
 			ErrCorruptData, reqNo, result.Seq, batchNo)
 	}
 	// 克数按实际数值核对：保存结果与原提交内容的写法可以不同（1.000 与 1），
-	// 但换算成实际克数必须一致；无法解析的克数写法本身就是损坏。
-	resultGrams, err := parseGrams(result.Grams)
+	// 但换算成实际克数必须一致；无法解析的克数写法本身就是损坏。投料内容
+	// 的核对规则（物料编号与登记人精确匹配、克数比较实际数量、时间比较
+	// 同一时刻）统一由 feedingContent 实现，与关闭结果中投料的核对共用
+	// 同一处，不再各自维护；克数不合法与内容不符仍分别报告。
+	resultContent, err := feedingViewContent(result).parse()
 	if err != nil {
-		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存结果的克数 %q 不合法",
-			ErrCorruptData, reqNo, batchNo, result.Grams)
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存结果的%v",
+			ErrCorruptData, reqNo, batchNo, err)
 	}
-	payloadGrams, err := parseGrams(payload.Grams)
+	payloadContent, err := feedingPayloadContent(payload).parse()
 	if err != nil {
-		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存的提交内容克数 %q 不合法",
-			ErrCorruptData, reqNo, batchNo, payload.Grams)
+		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存的提交内容%v",
+			ErrCorruptData, reqNo, batchNo, err)
 	}
 	// 保存结果必须与该序号的实际投料一致：物料编号、实际克数、投料时间
 	// （同一时刻，不区分时区写法）、登记人逐项核对——不能仅凭物料和数量
 	// 相同就忽略时间或登记人的差异。
-	if result.MaterialNo != rec.MaterialNo || resultGrams != rec.GramsMilli ||
-		!result.Time.Equal(rec.Time) || result.Registrar != rec.Registrar {
+	if !resultContent.matches(feedingRecordContent(*rec)) {
 		return fmt.Errorf("%w: 投料请求 %q 保存的结果与批次 %q 第 %d 条实际投料不一致（物料、克数、投料时间或登记人不符）",
 			ErrCorruptData, reqNo, batchNo, rec.Seq)
 	}
 	// 保存结果还必须符合原提交内容：同样按物料、实际克数、同一时刻、
 	// 登记人核对。
-	if result.MaterialNo != payload.MaterialNo || resultGrams != payloadGrams ||
-		!result.Time.Equal(payload.Time) || result.Registrar != payload.Registrar {
+	if !resultContent.matches(payloadContent) {
 		return fmt.Errorf("%w: 投料请求 %q 保存的结果与原提交内容（批次 %q）不一致（物料、克数、投料时间或登记人不符）",
 			ErrCorruptData, reqNo, batchNo)
 	}
@@ -1257,9 +1260,12 @@ func validateCloseBatchRequests(st *persistedState) error {
 // 投料（登记顺序）与逐物料数量核对都与该批次的实际记录一致。
 //
 // 数量按精确克数核对而非字符串写法：保存结果显示 1、批次记录为 1.000 是同一
-// 数量的正常写法差异；时间按同一时刻核对，不区分时区写法。关闭只确认已有
-// 投料、不要求数量吻合，因此没有投料、实投为零或差额为负都是合法内容，
-// 不能当成损坏。
+// 数量的正常写法差异；时间按同一时刻核对，不区分时区写法。逐条投料内容的
+// 判断标准（物料编号与登记人精确匹配、克数比较实际数量、时间比较同一时刻）
+// 统一由 feedingContent 实现，与投料请求结果的核对共用同一处；按登记顺序
+// 逐条对应、条数一致与序号相符是关闭场景自己的要求，在共用规则之外核对。
+// 关闭只确认已有投料、不要求数量吻合，因此没有投料、实投为零或差额为负
+// 都是合法内容，不能当成损坏。
 func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRecord) error {
 	var payload closeBatchPayload
 	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
@@ -1330,13 +1336,17 @@ func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRec
 	for i := range b.Feedings {
 		rec := b.Feedings[i]
 		fv := result.Feedings[i]
-		fg, err := parseGrams(fv.Grams)
+		// 每条投料的内容核对规则（物料编号与登记人精确匹配、克数比较实际
+		// 数量、时间比较同一时刻）统一由 feedingContent 实现，与投料请求
+		// 结果的核对共用同一处，不再各自维护；克数非法与内容不符分别报告，
+		// 错误中指明出错投料的位置。序号是否相符是关闭场景自己的要求
+		// （按登记顺序逐条对应），在共用规则之外单独核对。
+		got, err := feedingViewContent(fv).parse()
 		if err != nil {
-			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料的克数 %q 不合法",
-				ErrCorruptData, reqNo, batchNo, i+1, fv.Grams)
+			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料的%v",
+				ErrCorruptData, reqNo, batchNo, i+1, err)
 		}
-		if fv.Seq != rec.Seq || fv.MaterialNo != rec.MaterialNo || fg != rec.GramsMilli ||
-			!fv.Time.Equal(rec.Time) || fv.Registrar != rec.Registrar {
+		if fv.Seq != rec.Seq || !got.matches(feedingRecordContent(rec)) {
 			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料与批次实际投料不一致（序号、物料、克数、投料时间或登记人不符）",
 				ErrCorruptData, reqNo, batchNo, i+1)
 		}
