@@ -55,6 +55,16 @@ type Store struct {
 // 版本不一致（配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
 // 克数有任何差异；同编号的其他完整版本不能顶替，名称或用量相同也不算同一
 // 版本；每份克数按精确数值核对，1.000 与 1 不算差异），
+// 或任一已保存的成功创建批次请求的结果缺失、为 null、为空对象、无法读成
+// 完整批次结果，原提交内容无法解析或不符合创建要求，原请求对应的批次或
+// 原选配方版本不存在，或保存结果与原提交内容不一致（批次编号、配方编号
+// 与版本号、计划份数以原提交内容为准，配方名称取原提交所选的已登记版本；
+// 结果必须仍是草稿、没有投料，并按原选版本的物料顺序完整列出数量核对：
+// 应投量为创建时每份克数 × 创建时份数、实投量为零、差额为应投量的负值；
+// 另一批次或同编号配方的其他版本即使名称、物料和数量相同也不能顶替；
+// 批次后来改选配方、调整份数、开始执行、追加投料并关闭都属于批次现状，
+// 不改变首次创建的结果；数量按精确克数核对，1 与 1.000、0 与 0.000、
+// -1 与 -1.000 分别相同），
 // 或任一已保存的成功投料请求的结果缺失、为 null、为空对象，或其登记
 // 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
@@ -267,7 +277,14 @@ func (s *Store) load() error {
 //   - 每条已保存的成功请求都必须能重放回它第一次成功时的结果。配方登记
 //     请求的保存结果必须与原提交内容、台账中实际登记的版本三者一致
 //     （配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
-//     克数；克数按精确数值核对，1.000 与 1 是同一用量）；投料请求的保存
+//     克数；克数按精确数值核对，1.000 与 1 是同一用量）；创建批次请求的
+//     保存结果必须是原提交内容第一次创建成功时的批次结果——原请求对应的
+//     批次与原选配方版本都必须仍然存在，结果中的批次编号、配方编号与
+//     版本号、计划份数以原提交内容为准，配方名称取原选版本，状态为草稿、
+//     投料列表为空，逐物料应投量 = 创建时每份克数 × 创建时份数、实投量
+//     为零、差额为应投量的负值；批次后来改选配方、调整份数、开始执行、
+//     追加投料并关闭都属于批次现状，不改变首次创建的结果，另一批次或
+//     同编号配方的其他版本即使名称、物料和数量相同也不能顶替；投料请求的保存
 //     结果必须对应原请求批次中同序号的实际投料并符合原提交内容；开始
 //     执行请求的保存结果必须是原请求所指批次（必须存在且当前为执行中
 //     或已关闭）第一次开始执行时的批次结果——批次开始时确定的配方绑定
@@ -385,6 +402,9 @@ func validateState(st *persistedState) error {
 	// 一切按请求编号重放结果的路径判断——否则重放会把与台账实际内容不符的
 	// 保存结果当成第一次成功登记的结果返回。
 	if err := validateRecipeRequests(st); err != nil {
+		return err
+	}
+	if err := validateCreateBatchRequests(st); err != nil {
 		return err
 	}
 	if err := validateFeedingRequests(st); err != nil {
@@ -583,6 +603,163 @@ func validateRecipeRequest(st *persistedState, reqNo string, req *requestRecord)
 		if resultMilli != rm.GramsMilli || payloadMilli != rm.GramsMilli {
 			return fmt.Errorf("%w: 配方登记请求 %q（%s）物料 %q 的每份克数与实际登记版本不一致",
 				ErrCorruptData, reqNo, target, rm.MaterialNo)
+		}
+	}
+	return nil
+}
+
+// validateCreateBatchRequests 检查台账中每一条已保存的成功创建批次请求：请求
+// 记录里保存的返回结果，必须是原请求第一次创建成功时的那份批次结果——原提交
+// 内容确定的批次编号、配方编号与版本号、计划份数，配方名称取原提交所选的已
+// 登记版本，状态为草稿，投料列表为空，各物料按原选版本的物料顺序完整列出，
+// 应投量为创建时每份克数 × 创建时份数、实投量为零、差额为应投量的负值。本次
+// 只核对创建批次（createBatch）请求，其他操作的保存结果不在此检查。
+//
+// 保存结果缺失、为 null、为空对象、无法读成完整批次结果，原提交内容无法解析
+// 或不符合创建要求，原请求对应的批次或原选配方版本不存在，或上述对应关系有
+// 任何差异，整份台账即视为损坏：不能仅凭保存结果当作创建成功返回，不能用另
+// 一批次的结果或同编号配方的其他版本顶替（即使名称、物料和数量相同），也不
+// 能删除请求、补造批次或用当前查询结果覆盖损坏结果。该检查覆盖所有已保存的
+// 创建批次请求，与本次访问哪个批次无关。
+func validateCreateBatchRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opCreateBatch {
+			continue
+		}
+		if err := validateCreateBatchRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCreateBatchRequest 核对一条已保存的成功创建批次请求。对应关系：保存
+// 结果必须是原提交内容第一次创建成功时的视图——批次编号、配方编号与版本号、
+// 计划份数全部以原提交内容为准（草稿后来改选配方、调整份数，甚至开始执行、
+// 追加投料并关闭，都属于批次现状，不改变首次创建的结果）；配方名称取原提交
+// 所选的已登记版本；状态为草稿、投料列表为空；逐物料应投量 = 创建时每份克数
+// × 创建时份数、实投量为零、差额为应投量的负值。
+//
+// 原请求对应的批次与原选配方版本都必须仍然存在：批次或版本没有了，保存的
+// 结果不能单独作为创建成功的依据；同编号配方的其他版本即使名称、物料和数量
+// 相同，也不能顶替原选版本。批次当前记录只用于确认批次存在，不与保存结果
+// 比较计划内容——否则正常的草稿调整会把合法的首次创建结果误判为损坏。
+//
+// 数量按精确克数核对而非字符串写法：保存结果显示 1、应投量显示 1.000 是同一
+// 数量；实投 0 与 0.000 相同，-1 与 -1.000 相同，合法的零实投与负差额不是
+// 损坏。这只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交
+// 内容原文比较。
+func validateCreateBatchRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload createBatchPayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		// 提交内容本身已无法解析时无法确定关联批次，错误信息只指明请求编号。
+		return fmt.Errorf("%w: 创建批次请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	batchNo := payload.BatchNo
+	// 原提交内容必须符合创建要求：批次编号非空、份数为正整数。被改成非法
+	// 内容的提交不可能对应一次成功的创建。
+	if batchNo == "" || payload.Portions <= 0 {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存的提交内容不符合创建要求（批次编号为空或计划份数 %d 不是正整数）",
+			ErrCorruptData, reqNo, batchNo, payload.Portions)
+	}
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）缺少保存的创建结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	var result BatchView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存的创建结果无法解析为完整批次结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// null、空对象或读不出批次编号的结果都不能当作创建成功的结果。
+	if result.BatchNo == "" {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存的创建结果缺失或不完整",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原请求对应的批次必须仍然存在：批次没有了，保存的结果不能单独作为
+	// 创建成功的依据。批次后来的调整、执行、投料与关闭都属于现状，不影响
+	// 首次创建结果的核对。
+	if findBatch(st, batchNo) == nil {
+		return fmt.Errorf("%w: 创建批次请求 %q 对应的批次 %q 不存在，保存的创建结果不能单独作为创建成功的依据",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原提交所选的配方版本必须仍然登记在台账中：版本没有了，保存结果里的
+	// 配方名称与物料用量都失去依据；同编号配方的其他版本即使名称、物料和
+	// 数量相同，也不能顶替原选版本。
+	r := findRecipe(st, payload.RecipeNo, payload.Version)
+	if r == nil {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）原选配方 %q 版本 %q 未登记，保存的创建结果不能单独作为创建成功的依据",
+			ErrCorruptData, reqNo, batchNo, payload.RecipeNo, payload.Version)
+	}
+	// 保存结果必须指向原请求创建的批次：内容相同的另一批次的结果不能顶替。
+	if result.BatchNo != batchNo {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
+			ErrCorruptData, reqNo, batchNo, result.BatchNo)
+	}
+	// 配方编号、版本号、名称与计划份数必须与原提交内容一致；名称取原提交
+	// 所选的已登记版本。批次后来改选版本或调整份数不改变首次创建的结果。
+	if result.RecipeNo != payload.RecipeNo || result.RecipeVersion != payload.Version ||
+		result.RecipeName != r.Name {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的配方编号、版本或名称与原提交所选的配方 %q 版本 %q 不一致",
+			ErrCorruptData, reqNo, batchNo, payload.RecipeNo, payload.Version)
+	}
+	if result.PlannedPortions != payload.Portions {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的计划份数 %d 与原提交内容的份数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, payload.Portions)
+	}
+	// 首次创建的结果状态必须是草稿：被改成执行中或已关闭的现状，即与首次
+	// 创建记录不一致。
+	if result.Status != StatusDraft {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的状态为 %q，不是草稿",
+			ErrCorruptData, reqNo, batchNo, result.Status)
+	}
+	// 首次创建时不存在任何投料：保存结果里出现投料，说明混入了批次后来的
+	// 现状，与首次创建记录不一致。
+	if len(result.Feedings) != 0 {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果包含 %d 条投料，首次创建时的投料列表应为空，不能混入后来追加的投料",
+			ErrCorruptData, reqNo, batchNo, len(result.Feedings))
+	}
+	// 逐物料的数量核对必须与首次创建时相符：应投量按原选配方版本的每份
+	// 克数 × 创建时份数计算，实投量为零，差额为应投量的负值。物料按原选
+	// 版本的顺序完整列出，一项不多、一项不少。真实的零实投与负差额是合法
+	// 内容，按精确克数核对即可，不会误报。
+	required, err := planRequirements(r, payload.Portions)
+	if err != nil {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存的提交内容不符合创建要求：%v",
+			ErrCorruptData, reqNo, batchNo, err)
+	}
+	if len(result.Materials) != len(required) {
+		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果的物料核对项数 %d 与原选版本的物料项数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
+	}
+	for i, item := range required {
+		rm := result.Materials[i]
+		if rm.MaterialNo != item.materialNo {
+			return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与原选版本的物料 %q 不一致",
+				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
+		}
+		for _, check := range []struct {
+			name string
+			got  string
+			want gramsMilli
+		}{
+			{"应投量", rm.RequiredGrams, item.requiredGrams},
+			{"实投量", rm.ActualGrams, 0},
+			{"差额", rm.DifferenceGrams, -item.requiredGrams},
+		} {
+			got, err := parseSignedGrams(check.got)
+			if err != nil {
+				return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
+			}
+			if got != check.want {
+				return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果物料 %q 的%s %s 与首次创建时的值 %s 不一致",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
+			}
 		}
 	}
 	return nil
@@ -1097,10 +1274,10 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
-		// 保存的配方登记结果、投料结果、开始执行结果与关闭结果都已在本次
-		// load 的 validateState 中与实际登记内容核对一致（缺失、为 null、
-		// 为空对象或内容不符都已在上面拒绝），这里取回的就是第一次成功的
-		// 结果。
+		// 保存的配方登记结果、创建批次结果、投料结果、开始执行结果与关闭结果
+		// 都已在本次 load 的 validateState 中与实际登记内容核对一致（缺失、
+		// 为 null、为空对象或内容不符都已在上面拒绝），这里取回的就是第一次
+		// 成功的结果。
 		if err := json.Unmarshal(req.Result, out); err != nil {
 			return fmt.Errorf("重放请求 %q 的结果失败: %w", reqNo, err)
 		}
