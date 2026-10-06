@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 )
@@ -79,7 +80,11 @@ type Store struct {
 // 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
 // 内容不一致（其他批次的同序号投料不能作为对应记录，原批次不存在时
-// 保存的结果不能单独作为登记成功的依据），
+// 保存的结果不能单独作为登记成功的依据），或两个不同的成功投料请求
+// 指向同一批次的同一条投料登记（批次编号与登记序号相同；即使两条投料
+// 都还在、累计数量正确、每个请求的内容与结果单独核对都一致，也不能
+// 当成两次各自成功的登记，不能挑一个请求保留后继续；不同批次各自的
+// 序号 1 不算重复，批次关闭后保存的投料请求同样受约束），
 // 或任一已保存的成功开始执行请求的结果缺失、为 null、为空对象、无法读成
 // 批次结果，或保存结果与原请求所指批次第一次开始执行时的内容不一致（原
 // 批次必须存在且当前为执行中或已关闭；结果要对应批次开始时确定的配方
@@ -304,7 +309,12 @@ func (s *Store) load() error {
 //     顺序完整列出应投量 = 每份克数 × 份数、实投量为零、差额为应投量的
 //     负值，不遗漏、不重复、不混入其他版本物料，批次后来再次调整或已执行、
 //     关闭都不改变这次调整的结果，另一批次或同编号配方其他版本的结果不能
-//     顶替；投料请求的保存结果必须对应原请求批次中同序号的实际投料并符合原提交内容；开始
+//     顶替；投料请求的保存结果必须对应原请求批次中同序号的实际投料并符合原提交内容，
+//     且两个不同的成功投料请求不能指向同一批次的同一条投料（批次编号与登记序号
+//     相同即重复指向；即使批次里两条投料都在、累计数量正确，且每个请求的内容与
+//     结果单独核对都一致，也不能当成两次各自成功的登记，不能挑一个请求保留后继续；
+//     不同批次各有序号 1 且内容相同，只要各请求指向各自批次就不算重复；批次关闭后
+//     保存的投料请求同样受约束）；开始
 //     执行请求的保存结果必须是原请求所指批次（必须存在且当前为执行中
 //     或已关闭）第一次开始执行时的批次结果——批次开始时确定的配方绑定
 //     与计划份数、执行中状态、空投料列表，以及逐物料应投量 = 每份克数 ×
@@ -430,6 +440,13 @@ func validateState(st *persistedState) error {
 		return err
 	}
 	if err := validateFeedingRequests(st); err != nil {
+		return err
+	}
+	// 逐条核对通过后再做跨请求的指向唯一性核对：每个投料请求单看都可能与
+	// 自己的实际投料一致，但两个不同请求仍可能指向同一批次的同一条投料。
+	// 必须先于一切按请求编号重放结果的路径判断，否则两个请求会把同一次
+	// 登记当成两次各自成功的投料分别返回。
+	if err := validateFeedingRequestTargets(st); err != nil {
 		return err
 	}
 	if err := validateStartBatchRequests(st); err != nil {
@@ -1015,6 +1032,67 @@ func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord
 		!result.Time.Equal(payload.Time) || result.Registrar != payload.Registrar {
 		return fmt.Errorf("%w: 投料请求 %q 保存的结果与原提交内容（批次 %q）不一致（物料、克数、投料时间或登记人不符）",
 			ErrCorruptData, reqNo, batchNo)
+	}
+	return nil
+}
+
+// validateFeedingRequestTargets 在逐条投料请求核对都通过后，再做跨请求的
+// 指向唯一性核对：两个不同的成功投料请求不能指向同一批次的同一条投料
+// （批次编号 + 登记序号相同）。每个请求单独看都可能满足“保存结果、原
+// 提交内容与实际投料逐项一致”，但若同一批次的同一条实际投料同时被两个
+// 请求编号认领，这两个请求就不可能各自对应一次成功登记——批次里的投料
+// 仍在、累计数量正确也不改变这一点，重放任一请求都不应把同一次登记当成
+// 该请求自己的那次投料返回。
+//
+// 指向按“原请求对应的批次编号 + 保存结果的登记序号”认定：逐条核对已经
+// 保证该序号在该批次中存在、结果与该序号实际投料及原提交内容一致，这里
+// 不再重复这些检查，只判断 (批次, 序号) 是否被两个不同请求编号同时指向。
+// 不同批次各自从 1 开始编号，因此不同批次即使序号相同（各有序号 1）、
+// 投料内容也完全相同，只要各请求指向各自的批次就不属于重复指向。
+//
+// 一旦发现两个不同请求指向同一批次的同一条投料，整份台账即视为损坏：
+// 不能挑其中一个请求保留后继续使用另一个，不能删除请求、合并投料，也不
+// 能替结果重新分配序号。该检查覆盖所有已保存的投料请求，台账里另有正常
+// 批次、或本次只查询/写入别的正常记录，都不能绕过；批次关闭后保存的投料
+// 请求同样受约束。核对只读取现有记录，绝不改动原文件。
+func validateFeedingRequestTargets(st *persistedState) error {
+	// targets 按 (批次, 序号) 记录第一个指向它的投料请求；同一请求编号在
+	// 台账中只有一条请求记录（Requests 以请求编号为键），因此同一 (批次,
+	// 序号) 的第二次出现必然来自另一个不同的请求编号。请求记录按请求编号
+	// 排序后遍历，保证同一份损坏台账无论 map 的遍历顺序如何，报错中先出现
+	// 的都是编号较小的那个请求，错误信息稳定、可核对。
+	type target struct {
+		batchNo string
+		seq     int
+	}
+	reqNos := make([]string, 0, len(st.Requests))
+	for reqNo, req := range st.Requests {
+		if req.Op == opAddFeeding {
+			reqNos = append(reqNos, reqNo)
+		}
+	}
+	sort.Strings(reqNos)
+	owners := make(map[target]string)
+	for _, reqNo := range reqNos {
+		req := st.Requests[reqNo]
+		var payload addFeedingPayload
+		if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+			// 逐条核对（validateFeedingRequests）先于本检查执行，走到这里
+			// 提交内容必然可解析；防御性处理，保持损坏分类。
+			return fmt.Errorf("%w: 投料请求 %q 保存的提交内容无法解析",
+				ErrCorruptData, reqNo)
+		}
+		var result FeedingView
+		if err := json.Unmarshal(req.Result, &result); err != nil {
+			return fmt.Errorf("%w: 投料请求 %q 保存的登记结果无法解析",
+				ErrCorruptData, reqNo)
+		}
+		key := target{batchNo: payload.BatchNo, seq: result.Seq}
+		if first, ok := owners[key]; ok {
+			return fmt.Errorf("%w: 投料请求 %q 与 %q 指向了批次 %q 的同一条投料（登记序号 %d）：两个不同的成功投料请求不能对应同一次投料登记",
+				ErrCorruptData, first, reqNo, key.batchNo, key.seq)
+		}
+		owners[key] = reqNo
 	}
 	return nil
 }
