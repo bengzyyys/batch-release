@@ -40,6 +40,56 @@ func planRequirements(r *recipeRecord, portions int) ([]plannedMaterial, error) 
 	return out, nil
 }
 
+// materialReconciliation 是一种物料在一个批次中的数量核对结果
+// （千分之一克）：应投量、累计实投量与差额（实投减应投）。
+type materialReconciliation struct {
+	materialNo string
+	required   gramsMilli
+	actual     gramsMilli
+	difference gramsMilli
+}
+
+// reconcileBatchMaterials 是批次“逐物料数量核对”（应投量、实投量、差额）
+// 的唯一实现：给定批次记录 b 与其绑定的配方版本 r，按 r 的物料顺序逐项
+// 计算，每种物料恰有一项：
+//   - 应投量 = 每份克数 × 计划份数，统一由 planRequirements 计算（份数为
+//     正、千分之一克精度、逐物料 maxGramsMilli 上限等规则随之生效）；
+//   - 实投量只累计该批次中该物料的投料，统一由 feedingAccumulator 累计，
+//     其他物料与其他批次的数量不参与，物料之间不互相抵消；没有投料的物料
+//     实投为零，不消失；
+//   - 差额 = 实投减应投，可能为负；各物料的差额独立成立，总差额为零不能
+//     代表数量吻合。
+//
+// 批次查询视图（含关闭时返回的视图）与已保存关闭结果的核对共用这里，
+// 两处对同一批次使用一致的数量依据，不再各自计算；创建、草稿调整与开始
+// 执行结果的“无投料”核对见 validateUnfedRequirements。
+//
+// 本函数只负责数量规则本身，返回的错误不带错误分类；调用方按各自场景
+// 包装（读取路径为 ErrCorruptData 并补充批次编号等上下文）。
+func reconcileBatchMaterials(b *batchRecord, r *recipeRecord) ([]materialReconciliation, error) {
+	required, err := planRequirements(r, b.PlannedPortions)
+	if err != nil {
+		return nil, err
+	}
+	acc := newFeedingAccumulator()
+	for _, f := range b.Feedings {
+		if !acc.add(f.MaterialNo, f.GramsMilli) {
+			return nil, fmt.Errorf("物料 %q 的累计实投超出上限 %s 克", f.MaterialNo, maxGramsMilli)
+		}
+	}
+	out := make([]materialReconciliation, 0, len(required))
+	for _, item := range required {
+		actual := acc.total(item.materialNo)
+		out = append(out, materialReconciliation{
+			materialNo: item.materialNo,
+			required:   item.requiredGrams,
+			actual:     actual,
+			difference: actual - item.requiredGrams,
+		})
+	}
+	return out, nil
+}
+
 // validateUnfedRequirements 是“无投料批次结果”逐物料数量核对的唯一实现，
 // 创建批次、草稿调整与开始执行三类已保存成功请求在读取台账时共用这里，不再
 // 各自维护一份相同的核对。mats 是保存结果中按物料列出的数量核对项，r 与

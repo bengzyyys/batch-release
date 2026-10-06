@@ -1263,42 +1263,34 @@ func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRec
 				ErrCorruptData, reqNo, batchNo, i+1)
 		}
 	}
-	// 逐物料的数量核对也必须与该批次相符：应投量按批次实际绑定的配方
-	// 版本与计划份数计算，实投量按实际投料累计，差额为实投减应投。只改
-	// 坏核对差额、原始投料仍完整，同样属于结果与已确认记录不一致。真实
-	// 的零实投与负差额是合法内容，按精确克数核对即可，不会误报。
-	required, err := planRequirements(r, b.PlannedPortions)
+	// 逐物料的数量核对也必须与该批次相符：应投量、实投量与差额统一由
+	// reconcileBatchMaterials 按批次实际绑定的配方版本、计划份数与实际
+	// 投料计算，与批次查询视图共用同一套数量依据。只改坏核对差额、原始
+	// 投料仍完整，同样属于结果与已确认记录不一致。真实的零实投与负差额
+	// 是合法内容，按精确克数核对即可，不会误报。
+	recon, err := reconcileBatchMaterials(b, r)
 	if err != nil {
 		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 的%v",
 			ErrCorruptData, reqNo, batchNo, err)
 	}
-	acc := newFeedingAccumulator()
-	for _, f := range b.Feedings {
-		if !acc.add(f.MaterialNo, f.GramsMilli) {
-			return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 物料 %q 的累计实投超出可表示范围",
-				ErrCorruptData, reqNo, batchNo, f.MaterialNo)
-		}
-	}
-	if len(result.Materials) != len(required) {
+	if len(result.Materials) != len(recon) {
 		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的物料核对项数 %d 与批次实际核对项数 %d 不一致",
-			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(required))
+			ErrCorruptData, reqNo, batchNo, len(result.Materials), len(recon))
 	}
-	for i, item := range required {
+	for i, item := range recon {
 		rm := result.Materials[i]
 		if rm.MaterialNo != item.materialNo {
 			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与批次实际核对物料 %q 不一致",
 				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
 		}
-		actual := acc.total(item.materialNo)
-		diff := actual - item.requiredGrams
 		for _, check := range []struct {
 			name string
 			got  string
 			want gramsMilli
 		}{
-			{"应投量", rm.RequiredGrams, item.requiredGrams},
-			{"实投量", rm.ActualGrams, actual},
-			{"差额", rm.DifferenceGrams, diff},
+			{"应投量", rm.RequiredGrams, item.required},
+			{"实投量", rm.ActualGrams, item.actual},
+			{"差额", rm.DifferenceGrams, item.difference},
 		} {
 			got, err := parseSignedGrams(check.got)
 			if err != nil {
@@ -1470,37 +1462,27 @@ func buildBatchView(b *batchRecord, r *recipeRecord) (*BatchView, error) {
 		})
 	}
 
-	// 按物料累计实投量；台账在读取时已通过 validateFeedings 校验，
-	// 这里仍用同一套累计规则防一手整数回绕。
-	acc := newFeedingAccumulator()
-	for _, f := range b.Feedings {
-		if !acc.add(f.MaterialNo, f.GramsMilli) {
-			return nil, fmt.Errorf("%w: 批次 %q 物料 %q 的累计实投超出可表示范围",
-				ErrCorruptData, b.BatchNo, f.MaterialNo)
-		}
-	}
-
-	// 数量核对按配方物料逐项列出；应投量统一由 planRequirements 按本批次
-	// 绑定版本与计划份数计算，与创建、调整、读取校验共用同一套规则。
-	// 台账在读取时已通过 validateState 校验，这里仍防一手同一版本内物料
-	// 编号重复，避免返回重复的数量核对项。
-	required, err := planRequirements(r, b.PlannedPortions)
+	// 数量核对按配方物料逐项列出；应投量、累计实投量与差额统一由
+	// reconcileBatchMaterials 按本批次绑定版本、计划份数与实际投料计算，
+	// 与已保存关闭结果的核对共用同一套数量依据。台账在读取时已通过
+	// validateState 校验，这里仍防一手同一版本内物料编号重复，避免返回
+	// 重复的数量核对项。
+	recon, err := reconcileBatchMaterials(b, r)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 批次 %q 的%v", ErrCorruptData, b.BatchNo, err)
 	}
-	seen := make(map[string]bool, len(required))
-	for _, item := range required {
+	seen := make(map[string]bool, len(recon))
+	for _, item := range recon {
 		if seen[item.materialNo] {
 			return nil, fmt.Errorf("%w: 配方 %q 版本 %q 的物料编号 %q 重复",
 				ErrCorruptData, r.RecipeNo, r.Version, item.materialNo)
 		}
 		seen[item.materialNo] = true
-		act := acc.total(item.materialNo)
 		v.Materials = append(v.Materials, MaterialRequirement{
 			MaterialNo:      item.materialNo,
-			RequiredGrams:   item.requiredGrams.String(),
-			ActualGrams:     act.String(),
-			DifferenceGrams: (act - item.requiredGrams).String(),
+			RequiredGrams:   item.required.String(),
+			ActualGrams:     item.actual.String(),
+			DifferenceGrams: item.difference.String(),
 		})
 	}
 	return v, nil
