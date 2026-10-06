@@ -65,6 +65,16 @@ type Store struct {
 // 批次后来改选配方、调整份数、开始执行、追加投料并关闭都属于批次现状，
 // 不改变首次创建的结果；数量按精确克数核对，1 与 1.000、0 与 0.000、
 // -1 与 -1.000 分别相同），
+// 或任一已保存的成功草稿调整请求的结果缺失、为 null、为空对象、无法读成
+// 完整批次结果，原提交内容无法解析，原调整请求对应的批次不存在，保存结果
+// 的批次编号与原请求不一致，结果采用的配方编号与版本号未共同指向已登记
+// 版本、配方名称与该版本不一致，或结果不是草稿、带有投料、计划份数不是
+// 正整数（原请求明确指定了新配方或新份数时，结果还必须与指定值一致；
+// 配方编号与版本同时留空、份数传零的沿用结果以结果实际采用的版本与份数
+// 为准，不要求与批次当前计划相同），或数量核对没有按结果采用版本的物料
+// 顺序完整列出（应投量为每份克数 × 份数、实投量为零、差额为应投量的负值；
+// 不得遗漏、重复或混入其他版本的物料，应投量遵守精度与逐物料上限；另一
+// 批次或同编号配方其他版本的结果不能顶替，数量按精确克数核对），
 // 或任一已保存的成功投料请求的结果缺失、为 null、为空对象，或其登记
 // 序号在原请求对应的批次中不存在，或结果的物料编号、实际克数、投料
 // 时间（同一时刻不区分时区写法）、登记人与该序号的实际投料或原提交
@@ -284,7 +294,17 @@ func (s *Store) load() error {
 //     投料列表为空，逐物料应投量 = 创建时每份克数 × 创建时份数、实投量
 //     为零、差额为应投量的负值；批次后来改选配方、调整份数、开始执行、
 //     追加投料并关闭都属于批次现状，不改变首次创建的结果，另一批次或
-//     同编号配方的其他版本即使名称、物料和数量相同也不能顶替；投料请求的保存
+//     同编号配方的其他版本即使名称、物料和数量相同也不能顶替；草稿调整
+//     请求的保存结果必须是原提交内容第一次调整成功时的批次结果——原请求
+//     对应的批次必须仍然存在且结果批次编号一致，结果采用的配方编号与版本
+//     号必须共同指向已登记版本、名称与该版本一致，结果为草稿、没有投料、
+//     计划份数为正整数；原请求明确指定新配方或新份数时结果必须反映指定值，
+//     同时留空、传零的沿用项以结果实际采用的版本与份数为准、不要求与批次
+//     当前计划相同；数量核对按结果采用版本的物料顺序完整列出，应投量 =
+//     每份克数 × 份数、实投量为零、差额为应投量的负值，不遗漏、不重复、
+//     不混入其他版本的物料，遵守精度与逐物料上限，另一批次或其他版本的
+//     结果不能顶替，批次后来再次调整、执行或关闭不改变本次草稿结果；
+//     投料请求的保存
 //     结果必须对应原请求批次中同序号的实际投料并符合原提交内容；开始
 //     执行请求的保存结果必须是原请求所指批次（必须存在且当前为执行中
 //     或已关闭）第一次开始执行时的批次结果——批次开始时确定的配方绑定
@@ -405,6 +425,9 @@ func validateState(st *persistedState) error {
 		return err
 	}
 	if err := validateCreateBatchRequests(st); err != nil {
+		return err
+	}
+	if err := validateUpdateDraftRequests(st); err != nil {
 		return err
 	}
 	if err := validateFeedingRequests(st); err != nil {
@@ -758,6 +781,194 @@ func validateCreateBatchRequest(st *persistedState, reqNo string, req *requestRe
 			}
 			if got != check.want {
 				return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）保存结果物料 %q 的%s %s 与首次创建时的值 %s 不一致",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
+			}
+		}
+	}
+	return nil
+}
+
+// validateUpdateDraftRequests 检查台账中每一条已保存的成功草稿调整请求：请求
+// 记录里保存的返回结果，必须是原提交内容第一次调整成功时的那份批次结果——
+// 原调整请求对应的批次必须仍然存在，保存结果的批次编号必须与它一致；结果
+// 采用的配方编号与版本号必须共同指向一个已登记的配方版本，配方名称与该版本
+// 一致；结果必须仍是草稿、没有投料，计划份数为正整数。原请求明确指定了新
+// 配方（配方编号与版本号同时非空）或新份数（份数非零）时，结果必须反映指定
+// 的值；两个字段都留空、份数传零的沿用语义保持不变——沿用项以结果实际采用
+// 的配方版本与份数为准，不要求与批次当前计划相同。本次只核对草稿调整
+// （updateDraftBatch）请求，其他操作的保存结果不在此检查。
+//
+// 数量核对以结果采用的配方版本和份数为准，按该版本物料顺序完整列出全部
+// 物料：每项应投量为每份克数 × 份数、实投量为零、差额为应投量的负值；物料
+// 一项不多、一项不少，不能遗漏、重复或混入其他版本的物料；各物料应投量继续
+// 遵守千分之一克精度与逐物料上限。数量按精确克数核对：1 与 1.000、0 与
+// 0.000、-1 与 -1.000 分别视为相同数量。
+//
+// 保存结果缺失、为 null、为空对象、无法解析，或上述对应关系不成立（原请求
+// 对应的批次不存在、结果批次编号对不上、采用的配方版本未登记、名称不符、
+// 份数非正、状态不是草稿、混入投料、物料或数量核对项对不上），整份台账即
+// 视为损坏：不能仅凭保存结果当作调整成功返回，不能用同编号配方的其他版本或
+// 另一批次同一次调整的结果顶替，也不能删除请求、补造批次或用批次当前计划
+// 覆盖损坏结果。该检查覆盖所有已保存的草稿调整请求，与本次访问哪个批次
+// 无关。
+func validateUpdateDraftRequests(st *persistedState) error {
+	for reqNo, req := range st.Requests {
+		if req == nil {
+			return fmt.Errorf("%w: 请求编号 %q 的请求记录为空", ErrCorruptData, reqNo)
+		}
+		if req.Op != opUpdateDraft {
+			continue
+		}
+		if err := validateUpdateDraftRequest(st, reqNo, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateUpdateDraftRequest 核对一条已保存的成功草稿调整请求。核对一律以
+// “保存结果实际采用的配方版本与份数”为准，而不是批次当前计划：批次后来再次
+// 调整、开始执行、追加投料甚至关闭都属于批次现状，不改变这一次调整成功时的
+// 结果——早先合法的草稿结果不能因此被误判为损坏。
+//
+// 原请求明确指定（配方编号与版本号同时非空、份数非零）的项必须与保存结果
+// 一致，不能用其他版本或另一批次的结果顶替；留空、传零的沿用项没有原提交
+// 值可比对，只校验结果自身采用的值完整、合法（版本已登记、份数为正整数、
+// 名称与版本一致、数量核对完整）。
+//
+// 数量按精确克数核对而非字符串写法：保存结果显示 1、应投量显示 1.000 是同一
+// 数量；实投 0 与 0.000 相同，-1 与 -1.000 相同，合法的零实投与负差额不是
+// 损坏。这只影响读取核对，不改变请求内容的精确匹配规则——重放判定仍按提交
+// 内容原文比较。
+func validateUpdateDraftRequest(st *persistedState, reqNo string, req *requestRecord) error {
+	var payload updateDraftPayload
+	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+		// 提交内容本身已无法解析时无法确定关联批次，错误信息只指明请求编号。
+		return fmt.Errorf("%w: 草稿调整请求 %q 保存的提交内容无法解析",
+			ErrCorruptData, reqNo)
+	}
+	batchNo := payload.BatchNo
+	// 能确定批次编号时，错误信息始终带上它，便于定位损坏的调整结果。
+	if len(req.Result) == 0 {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）缺少保存的调整结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	var result BatchView
+	if err := json.Unmarshal(req.Result, &result); err != nil {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存的调整结果无法解析为完整批次结果",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// null、空对象或读不出批次编号的结果都不能当作调整成功的结果。
+	if result.BatchNo == "" {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存的调整结果缺失或不完整",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 原调整请求对应的批次必须仍然存在：批次没有了，保存的结果不能单独作为
+	// 调整成功的依据。此后错误信息中“能确定的批次编号”以原请求的批次为准。
+	if findBatch(st, batchNo) == nil {
+		return fmt.Errorf("%w: 草稿调整请求 %q 对应的批次 %q 不存在，保存的调整结果不能单独作为调整成功的依据",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 保存结果的批次编号必须与原请求的批次一致：另一批次同一次调整的结果
+	// 即使配方、份数与数量完全相同，也不能顶替。
+	if result.BatchNo != batchNo {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
+			ErrCorruptData, reqNo, batchNo, result.BatchNo)
+	}
+	// 原请求只给配方编号或只给版本号属于当时就会被拒绝的非法调整，不可能
+	// 对应一次成功的调整。两个字段都留空则是沿用原配方的合法语义。
+	if (payload.RecipeNo == "") != (payload.Version == "") {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存的提交内容不符合调整要求（配方编号与版本号必须同时给出或同时留空）",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	// 份数传零表示沿用原份数，是合法语义；负数份数当时就会被拒绝。
+	if payload.Portions < 0 {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存的提交内容不符合调整要求（计划份数 %d 不是正整数或零）",
+			ErrCorruptData, reqNo, batchNo, payload.Portions)
+	}
+	// 结果采用的配方编号与版本号必须共同指向一个已登记的配方版本：版本没
+	// 有了，结果里的名称与物料用量都失去依据；同编号配方的其他版本不能顶替。
+	r := findRecipe(st, result.RecipeNo, result.RecipeVersion)
+	if r == nil {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果采用的配方 %q 版本 %q 未登记，保存的调整结果不能单独作为调整成功的依据",
+			ErrCorruptData, reqNo, batchNo, result.RecipeNo, result.RecipeVersion)
+	}
+	// 原请求明确指定了新配方（编号与版本同时非空）时，结果必须反映指定的
+	// 版本，不能用同编号的其他版本顶替；两个字段都留空时结果采用哪个版本
+	// 都可能是当时沿用的版本（批次后来可能再调整），不与原提交比对。
+	if payload.RecipeNo != "" {
+		if result.RecipeNo != payload.RecipeNo || result.RecipeVersion != payload.Version {
+			return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的配方编号或版本号与原提交指定的配方 %q 版本 %q 不一致",
+				ErrCorruptData, reqNo, batchNo, payload.RecipeNo, payload.Version)
+		}
+	}
+	// 结果中的配方编号、版本号必须非空（findRecipe 已挡掉空标识，但这里给出
+	// 明确的损坏说明），名称必须与采用版本的登记名称一致。
+	if result.RecipeNo == "" || result.RecipeVersion == "" {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果缺少配方编号或版本号",
+			ErrCorruptData, reqNo, batchNo)
+	}
+	if result.RecipeName != r.Name {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的配方名称 %q 与采用版本 %q 版本 %q 的名称 %q 不一致",
+			ErrCorruptData, reqNo, batchNo, result.RecipeName, r.RecipeNo, r.Version, r.Name)
+	}
+	// 结果的计划份数必须为正整数；原请求明确指定了新份数（非零）时还必须
+	// 与指定值一致，不能用另一批次或后来调整的份数顶替。
+	if result.PlannedPortions <= 0 {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的计划份数 %d 不是正整数",
+			ErrCorruptData, reqNo, batchNo, result.PlannedPortions)
+	}
+	if payload.Portions != 0 && result.PlannedPortions != payload.Portions {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的计划份数 %d 与原提交指定的份数 %d 不一致",
+			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, payload.Portions)
+	}
+	// 调整成功时的结果必须仍是草稿：批次后来开始执行或关闭属于现状，保存
+	// 结果被改成现状即与本次调整记录不一致。
+	if result.Status != StatusDraft {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的状态为 %q，不是草稿",
+			ErrCorruptData, reqNo, batchNo, result.Status)
+	}
+	// 调整发生在草稿阶段，结果里不能有任何投料：出现投料说明混入了批次后来
+	// 开始执行后的现状。
+	if len(result.Feedings) != 0 {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果包含 %d 条投料，草稿调整成功时的投料列表应为空，不能混入后来追加的投料",
+			ErrCorruptData, reqNo, batchNo, len(result.Feedings))
+	}
+	// 数量核对以结果采用的配方版本与份数为准：应投量 = 该版本每份克数 ×
+	// 结果份数，实投量为零，差额为应投量的负值。物料按该版本顺序完整列出，
+	// 一项不多、一项不少，不能遗漏、重复或混入其他版本的物料。planRequirements
+	// 同时落实千分之一克精度与逐物料上限（份数为正整数已在上面确认）。
+	required, err := planRequirements(r, result.PlannedPortions)
+	if err != nil {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果采用的计划不合法：%v",
+			ErrCorruptData, reqNo, batchNo, err)
+	}
+	if len(result.Materials) != len(required) {
+		return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果的物料核对项数 %d 与采用版本 %q 版本 %q 的物料项数 %d 不一致，不能遗漏、重复或混入其他版本的物料",
+			ErrCorruptData, reqNo, batchNo, len(result.Materials), r.RecipeNo, r.Version, len(required))
+	}
+	for i, item := range required {
+		rm := result.Materials[i]
+		if rm.MaterialNo != item.materialNo {
+			return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果第 %d 项核对物料 %q 与采用版本的物料 %q 不一致（顺序、遗漏或混入了其他版本的物料）",
+				ErrCorruptData, reqNo, batchNo, i+1, rm.MaterialNo, item.materialNo)
+		}
+		for _, check := range []struct {
+			name string
+			got  string
+			want gramsMilli
+		}{
+			{"应投量", rm.RequiredGrams, item.requiredGrams},
+			{"实投量", rm.ActualGrams, 0},
+			{"差额", rm.DifferenceGrams, -item.requiredGrams},
+		} {
+			got, err := parseSignedGrams(check.got)
+			if err != nil {
+				return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果物料 %q 的%s %q 不合法",
+					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got)
+			}
+			if got != check.want {
+				return fmt.Errorf("%w: 草稿调整请求 %q（批次 %q）保存结果物料 %q 的%s %s 与本次调整采用版本及份数算出的值 %s 不一致",
 					ErrCorruptData, reqNo, batchNo, item.materialNo, check.name, check.got, check.want)
 			}
 		}
@@ -1274,7 +1485,7 @@ func (s *Store) write(reqNo, op string, payload any, apply func(*persistedState)
 			return fmt.Errorf("%w: 请求编号 %q 已用于操作 %q，不能再用于操作 %q 或不同内容",
 				ErrRequestConflict, reqNo, req.Op, op)
 		}
-		// 保存的配方登记结果、创建批次结果、投料结果、开始执行结果与关闭结果
+		// 保存的配方登记结果、创建批次结果、草稿调整结果、投料结果、开始执行结果与关闭结果
 		// 都已在本次 load 的 validateState 中与实际登记内容核对一致（缺失、
 		// 为 null、为空对象或内容不符都已在上面拒绝），这里取回的就是第一次
 		// 成功的结果。
