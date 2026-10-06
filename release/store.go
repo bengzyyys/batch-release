@@ -1006,30 +1006,30 @@ func validateFeedingRequest(st *persistedState, reqNo string, req *requestRecord
 		return fmt.Errorf("%w: 投料请求 %q 保存结果的登记序号 %d 在批次 %q 中不存在",
 			ErrCorruptData, reqNo, result.Seq, batchNo)
 	}
-	// 克数按实际数值核对：保存结果与原提交内容的写法可以不同（1.000 与 1），
-	// 但换算成实际克数必须一致；无法解析的克数写法本身就是损坏。
-	resultGrams, err := parseGrams(result.Grams)
-	if err != nil {
+	// 物料、克数、投料时间、登记人这四项内容是否相同，与关闭结果中逐条投料
+	// 的核对共用同一处规则（feeding_check.go 的 compareFeedingContent）：
+	// 克数按实际数量比较（1.000 与 1 相同），时间按同一时刻比较（不区分时区
+	// 写法），物料编号与登记人精确匹配；任一项不同都不接受，即使克数合计
+	// 相同。克数写法无法解析先作为“克数非法”报告，与字段取值不同的“内容
+	// 不符”区分，不能合并成一个泛化的比较失败。
+	resultContent, ok := feedingContentFromView(result)
+	if !ok {
 		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存结果的克数 %q 不合法",
 			ErrCorruptData, reqNo, batchNo, result.Grams)
 	}
-	payloadGrams, err := parseGrams(payload.Grams)
-	if err != nil {
+	payloadContent, ok := feedingContentFromPayload(payload)
+	if !ok {
 		return fmt.Errorf("%w: 投料请求 %q（批次 %q）保存的提交内容克数 %q 不合法",
 			ErrCorruptData, reqNo, batchNo, payload.Grams)
 	}
-	// 保存结果必须与该序号的实际投料一致：物料编号、实际克数、投料时间
-	// （同一时刻，不区分时区写法）、登记人逐项核对——不能仅凭物料和数量
-	// 相同就忽略时间或登记人的差异。
-	if result.MaterialNo != rec.MaterialNo || resultGrams != rec.GramsMilli ||
-		!result.Time.Equal(rec.Time) || result.Registrar != rec.Registrar {
+	// 第一层：保存结果必须与该序号的实际投料一致。不能仅凭物料和数量相同
+	// 就忽略时间或登记人的差异；其他批次的同序号投料已在序号定位时排除。
+	if compareFeedingContent(resultContent, feedingContentFromRecord(*rec)).anyMismatch() {
 		return fmt.Errorf("%w: 投料请求 %q 保存的结果与批次 %q 第 %d 条实际投料不一致（物料、克数、投料时间或登记人不符）",
 			ErrCorruptData, reqNo, batchNo, rec.Seq)
 	}
-	// 保存结果还必须符合原提交内容：同样按物料、实际克数、同一时刻、
-	// 登记人核对。
-	if result.MaterialNo != payload.MaterialNo || resultGrams != payloadGrams ||
-		!result.Time.Equal(payload.Time) || result.Registrar != payload.Registrar {
+	// 第二层：保存结果还必须符合原提交内容，核对维度与第一层完全相同。
+	if compareFeedingContent(resultContent, payloadContent).anyMismatch() {
 		return fmt.Errorf("%w: 投料请求 %q 保存的结果与原提交内容（批次 %q）不一致（物料、克数、投料时间或登记人不符）",
 			ErrCorruptData, reqNo, batchNo)
 	}
@@ -1321,25 +1321,23 @@ func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRec
 			ErrCorruptData, reqNo, batchNo, result.Status)
 	}
 	// 投料必须一条不多、一条不少地按登记顺序保留：同物料的多次投料不能
-	// 合并，序号、物料、数量、时间与登记人逐项核对。数量按精确克数比较
-	// （1.000 与 1 是同一数量），时间按同一时刻比较（不区分时区写法）。
-	if len(result.Feedings) != len(b.Feedings) {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的投料条数 %d 与批次实际投料条数 %d 不一致，不能少一条、多一条或合并同物料的记录",
-			ErrCorruptData, reqNo, batchNo, len(result.Feedings), len(b.Feedings))
-	}
-	for i := range b.Feedings {
-		rec := b.Feedings[i]
-		fv := result.Feedings[i]
-		fg, err := parseGrams(fv.Grams)
-		if err != nil {
-			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料的克数 %q 不合法",
-				ErrCorruptData, reqNo, batchNo, i+1, fv.Grams)
-		}
-		if fv.Seq != rec.Seq || fv.MaterialNo != rec.MaterialNo || fg != rec.GramsMilli ||
-			!fv.Time.Equal(rec.Time) || fv.Registrar != rec.Registrar {
-			return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料与批次实际投料不一致（序号、物料、克数、投料时间或登记人不符）",
-				ErrCorruptData, reqNo, batchNo, i+1)
-		}
+	// 合并，也不能按投料时间重新排序。条数、登记位置与序号的对应，以及
+	// 每个位置上物料、克数、时间、登记人的逐项核对，统一由
+	// compareCloseFeedings 按关闭结果场景的业务依据处理；其中“两条投料内容
+	// 是否相同”与投料请求核对共用 compareFeedingContent 同一处规则（克数按
+	// 实际数量、时间按同一时刻、物料与登记人精确匹配）。克数非法与内容
+	// 不符通过错误类型区分，分别保留原有错误说明，并指出出错投料的位置。
+	switch err := compareCloseFeedings(result.Feedings, b.Feedings).(type) {
+	case nil:
+	case *feedingGramError:
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料的克数 %q 不合法",
+			ErrCorruptData, reqNo, batchNo, err.pos, err.text)
+	case *feedingEntryMismatch:
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果第 %d 条投料与批次实际投料不一致（序号、物料、克数、投料时间或登记人不符）",
+			ErrCorruptData, reqNo, batchNo, err.pos)
+	default:
+		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）%v",
+			ErrCorruptData, reqNo, batchNo, err)
 	}
 	// 逐物料的数量核对也必须与该批次相符：数量依据统一由 reconcileMaterials
 	// 以原请求所指已关闭批次记录实际绑定的版本、计划份数与全部投料计算
