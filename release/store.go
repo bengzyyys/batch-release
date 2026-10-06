@@ -1100,6 +1100,135 @@ func validateFeedingRequestTargets(st *persistedState) error {
 	return nil
 }
 
+// batchResultKind 标识一份已保存的批次结果属于哪类操作：开始执行与关闭批次
+// 两类成功结果在读取台账时共有同一套“原批次归属 + 配方与计划对应”核对，
+// 但两类结果的状态、投料与数量含义不同，必须分别核对、不能互相替代。
+type batchResultKind struct {
+	// op 是这类结果对应的操作类别，用于错误信息，区分“开始执行请求”与
+	// “关闭请求”。
+	op string
+	// resultNoun 是这类结果在错误信息中的称呼（“开始结果”/“关闭结果”）。
+	resultNoun string
+	// successPhrase 是这类操作成功时的称呼（“开始成功”/“关闭成功”），用于
+	// 原批次不存在时说明保存结果不能单独作为哪次成功的依据。
+	successPhrase string
+	// allowedStatus 是原请求所指批次当前必须处于的状态：开始结果要求批次为
+	// 执行中或已关闭（开始后状态只会前进），关闭结果要求批次仍为已关闭。
+	allowedStatus []BatchStatus
+	// statusText 描述 allowedStatus，用于批次当前状态不符时的错误信息。
+	statusText string
+}
+
+var (
+	// startBatchResultKind 是开始执行结果的类别：原批次当前为执行中或已关闭
+	// 时，保存的开始结果才可能成立。
+	startBatchResultKind = batchResultKind{
+		op:            "开始执行请求",
+		resultNoun:    "开始结果",
+		successPhrase: "开始成功",
+		allowedStatus: []BatchStatus{StatusExecuting, StatusClosed},
+		statusText:    "执行中或已关闭",
+	}
+	// closeBatchResultKind 是关闭结果的类别：原批次必须仍为已关闭，保存的
+	// 关闭结果才可能成立。
+	closeBatchResultKind = batchResultKind{
+		op:            "关闭请求",
+		resultNoun:    "关闭结果",
+		successPhrase: "关闭成功",
+		allowedStatus: []BatchStatus{StatusClosed},
+		statusText:    "已关闭",
+	}
+)
+
+// validateBatchRequestAnchor 是开始执行结果与关闭结果共有的核对逻辑，只维护
+// 一份：两类已保存的成功批次结果都必须对应“原请求指定的那个批次、该批次开始
+// 执行时最终固定的配方编号与版本（名称取这个已登记版本）与计划份数”，不能因
+// 另一批次采用相同配方、相同份数与相同投料，就接受另一批次的结果。核对内容：
+//   - 保存结果必须存在、能解析为完整批次结果且读得出批次编号（缺失、为 null、
+//     为空对象或无法解析都不接受）；
+//   - 原请求所指批次必须存在，且当前状态符合该类结果的要求（开始结果要求执行
+//     中或已关闭，关闭结果要求仍为已关闭）；
+//   - 保存结果的批次编号必须与原请求所指批次一致——另一批次的结果不能顶替；
+//   - 保存结果的配方编号、版本、名称与计划份数必须与该批次开始时固定的配方
+//     版本（名称取该已登记版本）和计划份数一致。草稿阶段调整过计划的，以开始
+//     时最终选定的版本与份数为准（开始后两者已固定，批次当前记录就是这份
+//     计划）；创建草稿时的旧版本、旧份数不能沿用。
+//
+// 本函数只核对这两类结果共有的“归属与配方计划锚点”，两类结果各自的含义仍由
+// 调用方在通过锚点核对后分别核对、不能在这里被抹掉：开始结果必须是执行中、
+// 空投料与零实投的数量核对（validateStartBatchRequest），批次后来追加投料或
+// 关闭不会使它失效；关闭结果必须是已关闭、保留关闭确认的全部投料及数量核对
+// （validateCloseBatchRequest）。
+//
+// 错误统一按 ErrCorruptData 拒绝整份台账，并保留操作类别（kind.op）、请求编号、
+// 能确定的批次编号与具体不符原因，调用方只需在本函数返回 nil 后继续核对本类
+// 结果特有的状态、投料与数量内容。
+func validateBatchRequestAnchor(st *persistedState, kind batchResultKind, reqNo, batchNo string, resultRaw json.RawMessage) (*BatchView, *batchRecord, *recipeRecord, error) {
+	if len(resultRaw) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）缺少保存的%s",
+			ErrCorruptData, kind.op, reqNo, batchNo, kind.resultNoun)
+	}
+	var result BatchView
+	if err := json.Unmarshal(resultRaw, &result); err != nil {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存的%s无法解析为完整批次结果",
+			ErrCorruptData, kind.op, reqNo, batchNo, kind.resultNoun)
+	}
+	// null、空对象或读不出批次编号的结果都不能当作这类操作成功的结果。
+	if result.BatchNo == "" {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存的%s缺失或不完整",
+			ErrCorruptData, kind.op, reqNo, batchNo, kind.resultNoun)
+	}
+	// 原请求所指的批次必须存在：批次没有了，保存的结果不能单独作为这次操作
+	// 成功的依据。
+	b := findBatch(st, batchNo)
+	if b == nil {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q 对应的批次 %q 不存在，保存的%s不能单独作为%s的依据",
+			ErrCorruptData, kind.op, reqNo, batchNo, kind.resultNoun, kind.successPhrase)
+	}
+	// 原批次当前必须处于该类结果允许的状态：开始结果要求执行中或已关闭
+	// （开始后状态只会前进，退回草稿即与已确认记录不一致），关闭结果要求仍
+	// 为已关闭。
+	if !isValidBatchStatusAmong(b.Status, kind.allowedStatus) {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q 对应的批次 %q 当前状态为 %s，不是%s，保存的%s与已确认记录不一致",
+			ErrCorruptData, kind.op, reqNo, batchNo, b.Status, kind.statusText, kind.resultNoun)
+	}
+	// 保存结果必须指向原请求的那个批次：即使另一批次采用相同配方、相同份数
+	// 与相同投料，其结果也不能顶替。
+	if result.BatchNo != batchNo {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
+			ErrCorruptData, kind.op, reqNo, batchNo, result.BatchNo)
+	}
+	// 配方绑定与计划份数必须对应批次开始时固定的版本与份数。开始执行后两者
+	// 固定，批次当前记录即开始时确定的计划；草稿阶段调整过计划的，以这份最终
+	// 选定为准，不能沿用创建草稿时的旧版本、旧份数。批次已在前面的校验中确认
+	// 绑定的配方版本存在，这里仍防一手。
+	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
+	if r == nil {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q 对应的批次 %q 绑定的配方 %q 版本 %q 未登记",
+			ErrCorruptData, kind.op, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.RecipeNo != b.RecipeNo || result.RecipeVersion != b.RecipeVersion ||
+		result.RecipeName != r.Name {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存结果的配方编号、版本或名称与批次开始时确定的配方 %q 版本 %q 不一致",
+			ErrCorruptData, kind.op, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
+	}
+	if result.PlannedPortions != b.PlannedPortions {
+		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存结果的计划份数 %d 与批次开始时确定的份数 %d 不一致",
+			ErrCorruptData, kind.op, reqNo, batchNo, result.PlannedPortions, b.PlannedPortions)
+	}
+	return &result, b, r, nil
+}
+
+// isValidBatchStatusAmong 判断批次当前状态是否落在该类结果允许的状态集合中。
+func isValidBatchStatusAmong(status BatchStatus, allowed []BatchStatus) bool {
+	for _, s := range allowed {
+		if status == s {
+			return true
+		}
+	}
+	return false
+}
+
 // validateStartBatchRequests 检查台账中每一条已保存的成功开始执行请求：请求
 // 记录里保存的返回结果，必须是原请求所指批次第一次开始执行时的那份批次结果——
 // 原请求所指的批次必须存在且当前为执行中或已关闭，保存结果要对应这个批次开始
@@ -1129,12 +1258,12 @@ func validateStartBatchRequests(st *persistedState) error {
 	return nil
 }
 
-// validateStartBatchRequest 核对一条已保存的成功开始执行请求。对应关系：保存
-// 结果必须是原请求所指批次（提交内容中的批次编号）第一次开始执行时的视图——
-// 批次存在且当前为执行中或已关闭（开始执行只会从草稿前进，不会退回草稿），
-// 结果中的批次编号、配方绑定、计划份数与该批次开始时确定的实际记录一致，
-// 状态为执行中、投料列表为空、逐物料应投量 = 每份克数 × 计划份数、实投量为
-// 零、差额为应投量的负值。
+// validateStartBatchRequest 核对一条已保存的成功开始执行请求。原批次归属、
+// 批次当前状态（执行中或已关闭）、结果批次编号、配方绑定与计划份数这些与关闭
+// 结果共有的对应关系，统一由 validateBatchRequestAnchor（startBatchResultKind）
+// 核对，只维护一份；本函数只在锚点核对通过后，核对开始结果自己的含义：
+// 结果必须是原请求所指批次第一次开始执行时的视图——状态为执行中、投料列表
+// 为空、逐物料应投量 = 每份克数 × 计划份数、实投量为零、差额为应投量的负值。
 //
 // 批次后来的投料与关闭属于批次现状，不属于第一次开始的结果：保存结果里混入
 // 这些内容即与首次开始记录不一致；反过来，批次当前已投料或已关闭也不能成为
@@ -1152,55 +1281,9 @@ func validateStartBatchRequest(st *persistedState, reqNo string, req *requestRec
 			ErrCorruptData, reqNo)
 	}
 	batchNo := payload.BatchNo
-	if len(req.Result) == 0 {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）缺少保存的开始结果",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	var result BatchView
-	if err := json.Unmarshal(req.Result, &result); err != nil {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存的开始结果无法解析为完整批次结果",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	// null、空对象或读不出批次编号的结果都不能当作开始成功的结果。
-	if result.BatchNo == "" {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存的开始结果缺失或不完整",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	// 原请求所指的批次必须存在：批次没有了，保存的结果不能单独作为开始
-	// 成功的依据。
-	b := findBatch(st, batchNo)
-	if b == nil {
-		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 不存在，保存的开始结果不能单独作为开始成功的依据",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	// 批次当前只能是执行中或已关闭：开始执行后状态只会前进，若被改回草稿，
-	// 保存的开始结果与已确认记录不再一致。
-	if b.Status != StatusExecuting && b.Status != StatusClosed {
-		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 当前状态为 %s，不是执行中或已关闭，保存的开始结果与已确认记录不一致",
-			ErrCorruptData, reqNo, batchNo, b.Status)
-	}
-	// 保存结果必须指向原请求的批次：内容相同的另一批次的结果不能顶替。
-	if result.BatchNo != batchNo {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
-			ErrCorruptData, reqNo, batchNo, result.BatchNo)
-	}
-	// 配方绑定与计划份数必须对应批次开始时确定的版本与份数。开始执行后
-	// 两者固定，批次当前记录即首次开始时的计划；草稿阶段调整过计划的，
-	// 以这份最终选定为准。批次已在前面的校验中确认绑定的配方版本存在，
-	// 这里仍防一手。
-	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
-	if r == nil {
-		return fmt.Errorf("%w: 开始执行请求 %q 对应的批次 %q 绑定的配方 %q 版本 %q 未登记",
-			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
-	}
-	if result.RecipeNo != b.RecipeNo || result.RecipeVersion != b.RecipeVersion ||
-		result.RecipeName != r.Name {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的配方编号、版本或名称与批次开始时确定的配方 %q 版本 %q 不一致",
-			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
-	}
-	if result.PlannedPortions != b.PlannedPortions {
-		return fmt.Errorf("%w: 开始执行请求 %q（批次 %q）保存结果的计划份数 %d 与批次开始时确定的份数 %d 不一致",
-			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, b.PlannedPortions)
+	result, b, r, err := validateBatchRequestAnchor(st, startBatchResultKind, reqNo, batchNo, req.Result)
+	if err != nil {
+		return err
 	}
 	// 首次开始的结果状态必须是执行中：被改成关闭后的现状或其他值，即与
 	// 首次开始记录不一致。
@@ -1254,10 +1337,12 @@ func validateCloseBatchRequests(st *persistedState) error {
 	return nil
 }
 
-// validateCloseBatchRequest 核对一条已保存的成功关闭请求。对应关系：保存结果
-// 必须是原请求所指批次（提交内容中的批次编号）当前已关闭状态的完整视图——
-// 批次存在且仍为已关闭，结果中的批次编号、配方绑定、计划份数、状态、全部
-// 投料（登记顺序）与逐物料数量核对都与该批次的实际记录一致。
+// validateCloseBatchRequest 核对一条已保存的成功关闭请求。原批次归属、批次
+// 当前必须仍为已关闭、结果批次编号、配方绑定与计划份数这些与开始结果共有的
+// 对应关系，统一由 validateBatchRequestAnchor（closeBatchResultKind）核对，
+// 只维护一份；本函数只在锚点核对通过后，核对关闭结果自己的含义：保存结果
+// 必须是原请求所指批次关闭时确认的完整视图——状态为已关闭，投料一条不多、
+// 一条不少地按登记顺序保留，逐物料的应投量、实投量与差额与该批次相符。
 //
 // 数量按精确克数核对而非字符串写法：保存结果显示 1、批次记录为 1.000 是同一
 // 数量的正常写法差异；时间按同一时刻核对，不区分时区写法。逐条投料内容的
@@ -1274,52 +1359,9 @@ func validateCloseBatchRequest(st *persistedState, reqNo string, req *requestRec
 			ErrCorruptData, reqNo)
 	}
 	batchNo := payload.BatchNo
-	if len(req.Result) == 0 {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）缺少保存的关闭结果",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	var result BatchView
-	if err := json.Unmarshal(req.Result, &result); err != nil {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存的关闭结果无法解析为完整批次结果",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	// null、空对象或读不出批次编号的结果都不能当作关闭成功的结果。
-	if result.BatchNo == "" {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存的关闭结果缺失或不完整",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	// 原请求所指的批次必须存在并仍为已关闭：批次没有了，或已被改回其他
-	// 状态，保存的结果都不能单独作为关闭成功的依据。
-	b := findBatch(st, batchNo)
-	if b == nil {
-		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 不存在，保存的关闭结果不能单独作为关闭成功的依据",
-			ErrCorruptData, reqNo, batchNo)
-	}
-	if b.Status != StatusClosed {
-		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 当前状态为 %s，不是已关闭，保存的关闭结果与已确认记录不一致",
-			ErrCorruptData, reqNo, batchNo, b.Status)
-	}
-	// 保存结果必须指向原请求的批次：另一批次的结果即使配方与投料数量
-	// 完全相同，也不能顶替。
-	if result.BatchNo != batchNo {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
-			ErrCorruptData, reqNo, batchNo, result.BatchNo)
-	}
-	// 配方绑定与计划份数必须对应该批次实际绑定的版本与份数。批次已在
-	// 前面的校验中确认绑定的配方版本存在，这里仍防一手。
-	r := findRecipe(st, b.RecipeNo, b.RecipeVersion)
-	if r == nil {
-		return fmt.Errorf("%w: 关闭请求 %q 对应的批次 %q 绑定的配方 %q 版本 %q 未登记",
-			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
-	}
-	if result.RecipeNo != b.RecipeNo || result.RecipeVersion != b.RecipeVersion ||
-		result.RecipeName != r.Name {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的配方编号、版本或名称与批次实际绑定的配方 %q 版本 %q 不一致",
-			ErrCorruptData, reqNo, batchNo, b.RecipeNo, b.RecipeVersion)
-	}
-	if result.PlannedPortions != b.PlannedPortions {
-		return fmt.Errorf("%w: 关闭请求 %q（批次 %q）保存结果的计划份数 %d 与批次实际份数 %d 不一致",
-			ErrCorruptData, reqNo, batchNo, result.PlannedPortions, b.PlannedPortions)
+	result, b, r, err := validateBatchRequestAnchor(st, closeBatchResultKind, reqNo, batchNo, req.Result)
+	if err != nil {
+		return err
 	}
 	// 关闭结果确认的就是已关闭状态：状态被改成其他值即与已确认记录不一致。
 	if result.Status != StatusClosed {
