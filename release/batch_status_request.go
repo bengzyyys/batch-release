@@ -1,19 +1,22 @@
 package release
 
 import (
-	"encoding/json"
 	"fmt"
 )
 
 // statusTransitionRequest 概括读取台账时“批次状态变更类”已保存成功请求
-// （开始执行 startBatch、关闭批次 closeBatch）的核对上下文。两类结果的
-// 共有规则都在此核对一份：
-//   - 结果必须对应原请求指定的那个批次，不能因为另一批次采用相同配方、
-//     份数和投料，就接受另一批次的结果；
+// （开始执行 startBatch、关闭批次 closeBatch）的核对上下文。
+//
+// 四类批次操作共有的归属与完整性规则（原提交解析、保存结果完整、原批次
+// 存在、结果批次归属）统一由内嵌的 batchRequestCheck 各步骤核对一份，这里
+// 只按状态变更自己的先后顺序组织这些步骤，并补两类结果共有的状态与计划
+// 业务判断：
+//   - 原批次当前状态必须仍在该类结果允许的范围内（开始结果允许执行中或
+//     已关闭；关闭结果只允许已关闭）——状态只前进不回退；
 //   - 配方依据是该批次开始执行时最终固定的编号与版本，名称取这个已登记
-//     版本，份数也取开始时固定的计划。例如草稿最初采用第一版、五份，
-//     开始前改成第二版、三份，开始结果与关闭结果都应对应第二版、三份，
-//     不能沿用创建草稿时的旧计划。
+//     版本，份数也取开始时固定的计划。草稿最初采用第一版、五份，开始前
+//     改成第二版、三份时，开始结果与关闭结果都对应第二版、三份，不能
+//     沿用创建草稿时的旧计划。
 //
 // 两类结果的区别不在这层处理：开始结果仍是开始成功当时的执行中状态、
 // 空投料及相应数量核对，批次后来追加投料或关闭不会使它失效；关闭结果
@@ -25,13 +28,7 @@ import (
 // 操作类别、请求编号、能确定的批次编号及具体不符原因，不会退化成无法
 // 定位的通用提示。
 type statusTransitionRequest struct {
-	// opLabel 是错误信息中的操作类别（开始执行请求 / 关闭请求）。
-	opLabel string
-	// resultLabel 是“保存的xx结果”在错误信息中的叫法（开始结果 / 关闭结果）。
-	resultLabel string
-	// successLabel 说明这是哪一类成功（开始成功 / 关闭成功），用于原批次
-	// 不存在时的错误说明。
-	successLabel string
+	batchRequestCheck
 	// allowedStatusDesc 描述原批次当前必须处于的状态（执行中或已关闭 /
 	// 仍为已关闭），用于状态不符时的错误说明。
 	allowedStatusDesc string
@@ -46,12 +43,14 @@ type statusTransitionRequest struct {
 	allowClosed    bool
 }
 
-// startBatchRequestCheck 是已保存开始执行请求的共有核对配置：原批次当前
+// startBatchRequestCheck 是已保存开始执行请求的核对配置：原批次当前
 // 为执行中或已关闭即可，配方与份数表述为“批次开始时确定”。
 var startBatchRequestCheck = statusTransitionRequest{
-	opLabel:           "开始执行请求",
-	resultLabel:       "开始结果",
-	successLabel:      "开始成功",
+	batchRequestCheck: batchRequestCheck{
+		opLabel:      "开始执行请求",
+		resultLabel:  "开始结果",
+		successLabel: "开始成功",
+	},
 	allowedStatusDesc: "不是执行中或已关闭",
 	recipeBasisDesc:   "批次开始时确定的配方",
 	portionsBasisDesc: "批次开始时确定的份数",
@@ -59,12 +58,14 @@ var startBatchRequestCheck = statusTransitionRequest{
 	allowClosed:       true,
 }
 
-// closeBatchRequestCheck 是已保存关闭请求的共有核对配置：原批次必须仍为
+// closeBatchRequestCheck 是已保存关闭请求的核对配置：原批次必须仍为
 // 已关闭，配方与份数表述为“批次实际绑定/实际份数”。
 var closeBatchRequestCheck = statusTransitionRequest{
-	opLabel:           "关闭请求",
-	resultLabel:       "关闭结果",
-	successLabel:      "关闭成功",
+	batchRequestCheck: batchRequestCheck{
+		opLabel:      "关闭请求",
+		resultLabel:  "关闭结果",
+		successLabel: "关闭成功",
+	},
 	allowedStatusDesc: "不是已关闭",
 	recipeBasisDesc:   "批次实际绑定的配方",
 	portionsBasisDesc: "批次实际份数",
@@ -72,55 +73,33 @@ var closeBatchRequestCheck = statusTransitionRequest{
 	allowClosed:       true,
 }
 
-// resolve 核对开始执行/关闭两类已保存成功请求的共有规则，成功时返回
-// 指向原请求所指批次的记录 b、该批次绑定的已登记配方版本 r，以及解析
-// 后的保存结果视图。核对内容：
-//   - 原提交内容必须能解析（解析失败时无法确定关联批次，错误只指明请求
-//     编号与操作类别）；
-//   - 原请求所指批次必须存在；
-//   - 原批次当前状态必须在允许范围内（开始结果允许执行中或已关闭；关闭
-//     结果只允许已关闭）——状态只前进不回退，回退即与已确认记录不一致；
-//   - 保存结果缺失、为 null、为空对象或无法解析为完整批次结果时拒绝；
-//   - 保存结果的批次编号必须就是原请求指定的批次；
-//   - 保存结果的配方编号、版本与计划份数必须与该批次开始时最终固定的
-//     记录一致，配方名称取这个已登记版本的名称。
+// resolve 核对开始执行/关闭两类已保存成功请求。四类操作共有的步骤都委托
+// 给内嵌 batchRequestCheck 的同名方法（只维护一份），这里按状态变更原有
+// 的先后顺序组织，并在原批次存在后、结果归属确认前后插入状态准入与批次
+// 开始时固定的配方/份数核对。成功时返回指向原请求所指批次的记录 b、该
+// 批次绑定的已登记配方版本 r，以及解析后的保存结果视图。
 //
-// 至此共有规则结束：开始结果的执行中状态、空投料与零实投核对，以及
-// 关闭结果的已关闭状态、全部投料保留与含实投的完整数量核对，都不在这
-// 里判断，由调用方按各自结果含义继续核对。
+// 检查顺序与整理前一致：原提交内容可解析 → 保存结果完整 → 原批次存在 →
+// 当前状态准入 → 结果批次编号归属 → 结果配方编号/版本/名称与批次开始时
+// 固定的记录一致 → 计划份数一致。
+//
+// 至此共有与状态变更规则结束：开始结果的执行中状态、空投料与零实投
+// 核对，以及关闭结果的已关闭状态、全部投料保留与含实投的完整数量核对，
+// 都不在这里判断，由调用方按各自结果含义继续核对。
 func (cfg statusTransitionRequest) resolve(st *persistedState, reqNo string, req *requestRecord) (*batchRecord, *recipeRecord, *BatchView, error) {
-	// startBatchPayload 与 closeBatchPayload 都只有批次编号一个字段，用
-	// 匿名结构解析即可，不依赖具体载荷类型。
-	var payload struct {
-		BatchNo string
+	batchNo, err := cfg.parseRequestBatch(reqNo, req)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
-		// 提交内容本身已无法解析时无法确定关联批次，错误信息只指明请求编号
-		// 与操作类别。
-		return nil, nil, nil, fmt.Errorf("%w: %s %q 保存的提交内容无法解析",
-			ErrCorruptData, cfg.opLabel, reqNo)
-	}
-	batchNo := payload.BatchNo
-	if len(req.Result) == 0 {
-		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）缺少保存的%s",
-			ErrCorruptData, cfg.opLabel, reqNo, batchNo, cfg.resultLabel)
-	}
-	var result BatchView
-	if err := json.Unmarshal(req.Result, &result); err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存的%s无法解析为完整批次结果",
-			ErrCorruptData, cfg.opLabel, reqNo, batchNo, cfg.resultLabel)
-	}
-	// null、空对象或读不出批次编号的结果都不能当作成功结果。
-	if result.BatchNo == "" {
-		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存的%s缺失或不完整",
-			ErrCorruptData, cfg.opLabel, reqNo, batchNo, cfg.resultLabel)
+	result, err := cfg.requireBatchResult(reqNo, batchNo, req)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	// 原请求所指的批次必须存在：批次没有了，保存的结果不能单独作为成功
 	// 的依据。开始/关闭都只会让状态前进，没有退回草稿的路径。
-	b := findBatch(st, batchNo)
-	if b == nil {
-		return nil, nil, nil, fmt.Errorf("%w: %s %q 对应的批次 %q 不存在，保存的%s不能单独作为%s的依据",
-			ErrCorruptData, cfg.opLabel, reqNo, batchNo, cfg.resultLabel, cfg.successLabel)
+	b, err := cfg.requireExistingBatch(st, reqNo, batchNo)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	// 当前状态必须在允许范围内：开始结果允许执行中或已关闭（开始后状态
 	// 只前进，被改回草稿即不一致）；关闭结果只允许已关闭。
@@ -131,9 +110,8 @@ func (cfg statusTransitionRequest) resolve(st *persistedState, reqNo string, req
 	}
 	// 保存结果必须指向原请求指定的批次：另一批次即使采用相同配方、份数
 	// 和投料，其结果也不能顶替。
-	if result.BatchNo != batchNo {
-		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存结果的批次编号为 %q，不能用另一批次的结果顶替",
-			ErrCorruptData, cfg.opLabel, reqNo, batchNo, result.BatchNo)
+	if err := cfg.requireResultOwnedByBatch(reqNo, batchNo, result); err != nil {
+		return nil, nil, nil, err
 	}
 	// 配方绑定与计划份数对应批次开始时最终固定的版本与份数。开始执行后
 	// 两者固定，批次当前记录即开始时的计划；草稿阶段调整过计划的，以这
@@ -154,5 +132,5 @@ func (cfg statusTransitionRequest) resolve(st *persistedState, reqNo string, req
 		return nil, nil, nil, fmt.Errorf("%w: %s %q（批次 %q）保存结果的计划份数 %d 与%s %d 不一致",
 			ErrCorruptData, cfg.opLabel, reqNo, batchNo, result.PlannedPortions, cfg.portionsBasisDesc, b.PlannedPortions)
 	}
-	return b, r, &result, nil
+	return b, r, result, nil
 }
