@@ -56,6 +56,12 @@ type Store struct {
 // 版本不一致（配方编号、版本号、名称、物料项数、排列顺序、各项物料编号与每份
 // 克数有任何差异；同编号的其他完整版本不能顶替，名称或用量相同也不算同一
 // 版本；每份克数按精确数值核对，1.000 与 1 不算差异），
+// 或两个不同的成功创建批次请求的原提交指向同一个批次编号（即使两个提交
+// 完全相同、各自保存结果都是合法的草稿结果、配方份数与数量核对全都一致，
+// 或两个提交采用不同配方版本或份数但各自保存结果仍符合对应提交，也不能
+// 解释成两次合法创建；不能挑一个请求保留后继续，也不能合并、改号或重新
+// 创建批次来消除矛盾；不同批次各有自己的成功创建请求不受影响，草稿调整、
+// 开始执行与关闭请求引用同一批次属于正常后续操作，不参与本核对），
 // 或任一已保存的成功创建批次请求、成功草稿调整请求、成功开始执行请求或
 // 成功关闭请求的结果缺失、为 null、为空对象、无法读成完整批次结果或读不出
 // 批次编号，原提交内容无法解析，原请求对应的批次不存在，或保存结果的批次
@@ -347,7 +353,12 @@ func (s *Store) load() error {
 //     0 表示沿用，沿用值只须符合完整性与数量规则，不要求与批次当前计划
 //     相同，不能拿批次当前计划反推），两类结果都按各自
 //     依据版本的物料顺序完整列出应投量 = 每份克数 × 份数、实投量为零、
-//     差额为应投量的负值；投料请求的保存结果必须对应原请求批次中同序号的实际投料并符合原提交内容，
+//     差额为应投量的负值；两个不同的成功创建批次请求的原提交不能指向
+//     同一个批次编号（即使提交完全相同、保存结果各自合法，或采用不同
+//     配方版本/份数但各自结果仍符合对应提交，也不能当成两次合法创建，
+//     不能挑一个请求保留后继续；不同批次各有自己的创建请求不受影响，
+//     调整/开始/关闭请求引用同一批次属于正常后续操作）；投料请求的保存
+//     结果必须对应原请求批次中同序号的实际投料并符合原提交内容，
 //     且两个不同的成功投料请求不能指向同一批次的同一条投料（批次编号与登记序号
 //     相同即重复指向；即使批次里两条投料都在、累计数量正确，且每个请求的内容与
 //     结果单独核对都一致，也不能当成两次各自成功的登记，不能挑一个请求保留后继续；
@@ -477,6 +488,13 @@ func validateState(st *persistedState) error {
 		return err
 	}
 	if err := validateCreateBatchRequests(st); err != nil {
+		return err
+	}
+	// 逐条核对通过后再做跨请求的创建唯一性核对：每个创建请求单看都可能与
+	// 自己的批次记录一致，但两个不同请求编号仍可能保存了指向同一批次的
+	// 成功创建请求。必须先于一切按请求编号重放结果的路径判断，否则两个
+	// 请求都会被当成各自创建成功，分别返回首次创建结果。
+	if err := validateCreateBatchRequestTargets(st); err != nil {
 		return err
 	}
 	if err := validateUpdateDraftRequests(st); err != nil {
@@ -778,6 +796,59 @@ func validateCreateBatchRequest(st *persistedState, reqNo string, req *requestRe
 	if err := validateUnfedRequirements(result.Materials, r, payload.Portions); err != nil {
 		return fmt.Errorf("%w: 创建批次请求 %q（批次 %q）%v",
 			ErrCorruptData, reqNo, batchNo, err)
+	}
+	return nil
+}
+
+// validateCreateBatchRequestTargets 在逐条创建请求核对都通过后，再做跨请求的
+// 创建唯一性核对：两个不同的成功创建批次请求，其原提交不能指向同一个批次编号。
+// 每个请求单独看都可能满足“保存结果、原提交内容与批次记录一致”——例如同一
+// 批次的首次创建请求被保存到两个不同的请求编号下，两份内容完全相同、保存结果
+// 都是合法的草稿结果、配方份数与数量核对全都一致；或两个提交采用不同配方版本
+// 或份数、各自保存结果仍符合对应提交。但一个批次只可能经历一次首次创建：两个
+// 不同请求编号各自保存了指向同一批次的成功创建请求，就不可能各自对应一次合法
+// 创建，重放任一请求都不应把这次创建当成该请求自己的首次创建返回。
+//
+// 指向按“原提交内容中的批次编号”认定：逐条核对（validateCreateBatchRequests）
+// 已经保证原提交可解析、保存结果的批次编号与原提交一致，这里不再重复这些检查，
+// 只判断同一批次编号是否被两个不同请求编号的成功创建请求同时指向。不同批次各自
+// 有自己的成功创建请求，即使采用同一配方版本与份数也不属于冲突；草稿调整、开始
+// 执行与关闭请求引用同一批次属于正常后续操作，不参与本核对；已有批次没有保存
+// 创建请求时沿用原有读取规则，不要求补造请求。
+//
+// 一旦发现两个不同请求的成功创建请求指向同一批次，整份台账即视为损坏：不能挑
+// 其中一个请求保留后继续，不能删除请求、合并、改号或重新创建批次来消除矛盾。
+// 该检查覆盖所有已保存的创建批次请求，台账里另有正常批次、或本次只查询/写入
+// 别的正常记录，都不能绕过；批次后来调整过配方份数、已开始执行、投料并关闭，
+// 同样不能掩盖重复创建。核对只读取现有记录，绝不改动原文件。
+func validateCreateBatchRequestTargets(st *persistedState) error {
+	// owners 按批次编号记录第一个指向它的创建请求编号；同一请求编号在台账中
+	// 只有一条请求记录（Requests 以请求编号为键），因此同一批次编号的第二次
+	// 出现必然来自另一个不同的请求编号。请求记录按请求编号排序后遍历，保证
+	// 同一份损坏台账无论 map 的遍历顺序如何，报错中先出现的都是编号较小的
+	// 那个请求，错误信息稳定、可核对。
+	reqNos := make([]string, 0, len(st.Requests))
+	for reqNo, req := range st.Requests {
+		if req.Op == opCreateBatch {
+			reqNos = append(reqNos, reqNo)
+		}
+	}
+	sort.Strings(reqNos)
+	owners := make(map[string]string)
+	for _, reqNo := range reqNos {
+		req := st.Requests[reqNo]
+		var payload createBatchPayload
+		if err := json.Unmarshal([]byte(req.Payload), &payload); err != nil {
+			// 逐条核对（validateCreateBatchRequests）先于本检查执行，走到这里
+			// 提交内容必然可解析；防御性处理，保持损坏分类。
+			return fmt.Errorf("%w: 创建批次请求 %q 保存的提交内容无法解析",
+				ErrCorruptData, reqNo)
+		}
+		if first, ok := owners[payload.BatchNo]; ok {
+			return fmt.Errorf("%w: 创建批次请求 %q 与 %q 的原提交都指向批次 %q：同一批次不能有多个成功创建请求",
+				ErrCorruptData, first, reqNo, payload.BatchNo)
+		}
+		owners[payload.BatchNo] = reqNo
 	}
 	return nil
 }
