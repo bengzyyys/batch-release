@@ -103,9 +103,16 @@ type Store struct {
 // 字符串解码后的实际内容判断：直接写出的字符与 Unicode 转义写法表示
 // 同一字符的算同一个编号，不做去空格或忽略大小写等额外归一化；两份
 // 记录的操作、提交内容与返回结果完全相同也属于重复，内容不同、对应
-// 不同批次或不同写入操作同样如此）时，返回 ErrCorruptData（可用
-// errors.Is 判断），不会当成空台账继续保存，也不会返回可继续使用的
-// 台账对象。
+// 不同批次或不同写入操作同样如此），
+// 或台账最外层请求记录字段 requests 出现两次或更多次（字段名按 JSON
+// 字符串解码后的实际内容判断：直接写出的 requests 与把其中字符写成
+// Unicode 码位转义后解码得到 requests 的写法是同一个字段，"Requests"、
+// "REQUESTS" 等现有读取能识别的大小写变体同样如此；两段内容完全相同、
+// 各自保存不同编号，或其中一段为空对象、null 都不能挑选其中一段、
+// 拼接两段或重建请求结果；requests 对象内部同名键的重复另行按同编号
+// 重复处理，嵌套记录内部出现同名字段不算最外层重复）时，返回
+// ErrCorruptData（可用 errors.Is 判断），不会当成空台账继续保存，
+// 也不会返回可继续使用的台账对象。
 //
 // dir 可以是相对目录：其位置只按 Open 调用时的工作目录解析一次并固定。
 // 打开之后即使进程切换了工作目录，本对象的查询与保存仍始终指向最初打开
@@ -204,8 +211,9 @@ func (s *Store) load() error {
 	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {
-		// requests 对象中同一请求编号出现多份记录时，requestRecordMap 的
-		// 解析已经按损坏分类（ErrCorruptData）并写明重复编号，直接透传，
+		// requests 对象中同一请求编号出现多份记录（requestRecordMap），
+		// 或台账最外层 requests 字段出现两次（persistedState），解析阶段
+		// 都已按损坏分类（ErrCorruptData）并写明具体重复对象，直接透传，
 		// 不再包一层“解析失败”掩盖具体原因。
 		if errors.Is(err, ErrCorruptData) {
 			return err
