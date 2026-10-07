@@ -1,8 +1,10 @@
 package release
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -143,9 +145,67 @@ type requestRecord struct {
 	Result  json.RawMessage `json:"result"`
 }
 
+// requestRecordMap 是台账 requests 对象的持久化类型：以请求编号为键的成功
+// 请求记录表。同一请求编号在台账中只能有一份记录——标准库把 JSON 对象读进
+// map 时，同名的重复键只会静默保留其中一份，另一份就此脱离一切核对：两份
+// 保存的成功请求被写成同一个编号时，重放该编号可能返回后写入的那份结果，
+// 而不是第一次成功的结果。因此这里按 JSON 流逐键读取，解码后的实际编号
+// 出现第二次即以 ErrCorruptData 拒绝整份台账。
+//
+// 编号是否重复按 JSON 字符串解码后的实际内容判断：直接写出的字符与用
+// Unicode 转义写法表示同一字符的写法（例如连字符直接写出与写成转义形式）
+// 算同一个编号；不做去空格或忽略大小写等额外归一化，不同编号仍按精确匹配
+// 区分。两份记录的操作、提交内容与返回结果完全相同也属于重复；只有
+// requests 对象自身的键参与判断，各请求结果里同名的批次编号、物料编号等
+// 字段与此无关。
+type requestRecordMap map[string]*requestRecord
+
+// UnmarshalJSON 逐键读取 requests 对象并拒绝重复请求编号。发现同一编号
+// 第二次出现时返回包装 ErrCorruptData 的错误：不能挑第一份或最后一份继续
+// 使用，不能合并记录或删除重复项，也不能重新计算结果后掩盖冲突。
+func (m *requestRecordMap) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*m = nil
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("台账的 requests 必须是对象")
+	}
+	out := make(map[string]*requestRecord)
+	for dec.More() {
+		ktok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := ktok.(string)
+		if !ok {
+			return fmt.Errorf("台账的 requests 包含非字符串的请求编号")
+		}
+		if _, dup := out[key]; dup {
+			return fmt.Errorf("%w: 请求编号 %q 存在多份同编号请求记录，不能挑选、合并或删除其中一份后继续",
+				ErrCorruptData, key)
+		}
+		var rec *requestRecord
+		if err := dec.Decode(&rec); err != nil {
+			return err
+		}
+		out[key] = rec
+	}
+	if _, err := dec.Token(); err != nil { // 收尾的 '}'
+		return err
+	}
+	*m = out
+	return nil
+}
+
 type persistedState struct {
-	Version  int                       `json:"version"`
-	Recipes  []*recipeRecord           `json:"recipes"`
-	Batches  []*batchRecord            `json:"batches"`
-	Requests map[string]*requestRecord `json:"requests"`
+	Version  int              `json:"version"`
+	Recipes  []*recipeRecord  `json:"recipes"`
+	Batches  []*batchRecord   `json:"batches"`
+	Requests requestRecordMap `json:"requests"`
 }

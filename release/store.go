@@ -98,7 +98,12 @@ type Store struct {
 // 关闭请求还要求原批次仍为已关闭、结果状态为已关闭、保留全部投料及其
 // 登记顺序，投料的序号、物料、数量、时间、登记人逐项一致，逐物料的
 // 应投量、实投量与差额与批次相符（数量按精确克数核对，时间按同一时刻
-// 核对）时，返回 ErrCorruptData（可用
+// 核对），
+// 或台账 requests 对象中同一请求编号出现两次或更多次（编号按 JSON
+// 字符串解码后的实际内容判断：直接写出的字符与 Unicode 转义写法表示
+// 同一字符的算同一个编号，不做去空格或忽略大小写等额外归一化；两份
+// 记录的操作、提交内容与返回结果完全相同也属于重复，内容不同、对应
+// 不同批次或不同写入操作同样如此）时，返回 ErrCorruptData（可用
 // errors.Is 判断），不会当成空台账继续保存，也不会返回可继续使用的
 // 台账对象。
 //
@@ -186,7 +191,7 @@ func (s *Store) load() error {
 	data, err := os.ReadFile(filepath.Join(s.dir, stateFileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.state = &persistedState{Version: stateVersion, Requests: map[string]*requestRecord{}}
+			s.state = &persistedState{Version: stateVersion, Requests: requestRecordMap{}}
 			return nil
 		}
 		return fmt.Errorf("%w: 读取台账文件失败: %v", ErrCorruptData, err)
@@ -199,6 +204,12 @@ func (s *Store) load() error {
 	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {
+		// requests 对象中同一请求编号出现多份记录时，requestRecordMap 的
+		// 解析已经按损坏分类（ErrCorruptData）并写明重复编号，直接透传，
+		// 不再包一层“解析失败”掩盖具体原因。
+		if errors.Is(err, ErrCorruptData) {
+			return err
+		}
 		return fmt.Errorf("%w: 台账文件解析失败: %v", ErrCorruptData, err)
 	}
 	if st.Version != stateVersion {
@@ -208,7 +219,7 @@ func (s *Store) load() error {
 		return err
 	}
 	if st.Requests == nil {
-		st.Requests = map[string]*requestRecord{}
+		st.Requests = requestRecordMap{}
 	}
 	s.state = &st
 	return nil
@@ -1326,7 +1337,7 @@ func cloneState(st *persistedState) (*persistedState, error) {
 		return nil, err
 	}
 	if out.Requests == nil {
-		out.Requests = map[string]*requestRecord{}
+		out.Requests = requestRecordMap{}
 	}
 	return &out, nil
 }
