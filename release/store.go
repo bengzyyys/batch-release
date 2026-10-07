@@ -103,7 +103,14 @@ type Store struct {
 // 字符串解码后的实际内容判断：直接写出的字符与 Unicode 转义写法表示
 // 同一字符的算同一个编号，不做去空格或忽略大小写等额外归一化；两份
 // 记录的操作、提交内容与返回结果完全相同也属于重复，内容不同、对应
-// 不同批次或不同写入操作同样如此）时，返回 ErrCorruptData（可用
+// 不同批次或不同写入操作同样如此），或台账最外层的请求记录字段
+// requests 出现两次或更多次（字段是否指向 requests 按标准库解码 JSON
+// 字段名时的同一套规则判断：直接写出的 requests、把字母 q 写成其
+// Unicode 转义形式（re 后面跟反斜杠 u0071 再接 uests）的写法，以及
+// 大小写折叠后指向 requests 的写法（如 Requests、REQUESTS）都算同一
+// 字段；嵌套对象内部的同名字段不算最外层重复。两段内容完全相同、各自
+// 保存不同编号，或其中一段为空对象或 null 都同样拒绝，不选择其中一段、
+// 不拼接两段，也不重建请求结果）时，返回 ErrCorruptData（可用
 // errors.Is 判断），不会当成空台账继续保存，也不会返回可继续使用的
 // 台账对象。
 //
@@ -201,6 +208,26 @@ func (s *Store) load() error {
 		// 零字节文件（原本就为空或使用中被截断）一律按损坏处理——既不能当成
 		// 空台账补写，也不能凭内存中的旧记录还原，调用方必须明确知道无法读取。
 		return fmt.Errorf("%w: 台账文件 %q 没有内容", ErrCorruptData, filepath.Join(s.dir, stateFileName))
+	}
+	// 正式解码前先单独探测最外层请求记录字段（requests）是否出现多次。标准库
+	// 把顶层对象解码进 persistedState 时，每出现一次 requests 就对 Requests
+	// 字段调一次 requestRecordMap.UnmarshalJSON 并整体替换：后一段覆盖前一段，
+	// 前一段保存的成功请求结果会静默消失（调用方再提交原投料请求会被当成新
+	// 登记，平白增加一条投料），而正式解码本身无法区分“只出现一次”与“多次
+	// 后被覆盖”。探针只按标准库同样的字段匹配规则统计该字段被交付的次数：
+	// 把字段名中的字母写成等价 Unicode 转义（例如字母 q 的六字符转义写法）
+	// 或大小写折叠后（如 Requests）指向 requests 的写法都会命中，嵌套对象
+	// 内部的同名字段与 requests- 等近似名称则不会。发现第二次出现即返回
+	// ErrCorruptData，不选择其中一段、不拼接两段，也不重建请求结果。探针
+	// 忽略其他字段与 requests 各段内容，探针解码出现的其他错误交给下面的
+	// 正式解码按原有规则报告，避免改变既有的解析错误信息。
+	var requestsProbe struct {
+		Requests requestsFieldProbe `json:"requests"`
+	}
+	if err := json.Unmarshal(data, &requestsProbe); err != nil {
+		if errors.Is(err, ErrCorruptData) {
+			return err
+		}
 	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {

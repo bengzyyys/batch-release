@@ -203,6 +203,44 @@ func (m *requestRecordMap) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// requestsFieldName 是台账最外层请求记录字段的 JSON 名称，persistedState 中
+// 的 Requests 与 requestsFieldProbe 都用这同一个标签绑定。
+const requestsFieldName = "requests"
+
+// requestsFieldProbe 只在把台账顶层对象正式解码进 persistedState 之前使用：
+// 它不保存 requests 的内容，只统计最外层请求记录字段被标准库交付的次数。
+//
+// persistedState.Requests 是带自定义 UnmarshalJSON 的 map 类型，标准库把 JSON
+// 对象解码到非指针字段时，最外层每出现一次 requests 就新建一个空 map 调一次
+// UnmarshalJSON 后整体替换该字段——后一段会覆盖前一段，前一段里第一次登记
+// 保存的请求结果就此脱离一切核对与重放；调用方再拿原投料请求提交时会被当成
+// 新登记，平白增加一条投料。正式解码无法区分“字段出现了一次”与“出现多次、
+// 后一段覆盖了前一段”，因此在正式解码前先用本探针按同样的字段匹配规则计数。
+//
+// 字段是否指向 requests 完全交给标准库按既有规则判定：JSON 字符串转义解码后
+// 指向 requests 的写法（例如把其中字母 q 写成其 Unicode 转义的六个字符
+// 反斜杠、u、0、0、7、1）与大小写折叠后相等的写法（如 Requests、
+// REQUESTS）都会交付到这里，与正式解码、以及现有读取能识别的写法保持一致，
+// 不会留下可用转义或大小写绕过的缺口；requests- 等近似名称不会命中。嵌套
+// 对象（如某请求结果内部）里的同名字段不属于最外层，不会交付到顶层字段。
+// 探针只计数、不校验各段内容：两段完全相同、各自保存不同编号，或其中一段
+// 为空对象、null，第二次出现都同样拒绝。
+type requestsFieldProbe struct {
+	occurrences int
+}
+
+// UnmarshalJSON 在最外层请求记录字段每被交付一次时计数；第二次出现即返回
+// ErrCorruptData，让整份台账在正式解码前被拒绝——不选择其中一段、不拼接
+// 两段，也不重建任何请求结果。
+func (p *requestsFieldProbe) UnmarshalJSON(data []byte) error {
+	p.occurrences++
+	if p.occurrences > 1 {
+		return fmt.Errorf("%w: 台账最外层的请求记录字段 %q 重复出现：同一份台账的 %s 字段只能出现一次，第二次出现即按数据损坏处理，不能选择其中一段、拼接两段或重建请求结果",
+			ErrCorruptData, requestsFieldName, requestsFieldName)
+	}
+	return nil
+}
+
 type persistedState struct {
 	Version  int              `json:"version"`
 	Recipes  []*recipeRecord  `json:"recipes"`
