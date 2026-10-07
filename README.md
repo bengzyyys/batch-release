@@ -155,7 +155,9 @@ JSON 对象解码遇到同名字段时会用后一段覆盖前一段：若最外
 物料记录编号和生产一份所需的克数（正数、最多三位小数）。
 
 ```go
-recipe, err := s.RegisterRecipe("req-001", "R1", "v1", "配方一", []release.MaterialInput{
+// 独立片段：与下一节的连续流程不在同一数据位置，请求编号也刻意区分，
+// 避免读者把两段示例按顺序放进同一台账时发生请求编号冲突。
+recipe, err := s.RegisterRecipe("req-recipe-1", "R9", "v1", "配方九", []release.MaterialInput{
     {MaterialNo: "M1", Grams: "100"},
     {MaterialNo: "M2", Grams: "0.5"},
 })
@@ -163,25 +165,245 @@ recipe, err := s.RegisterRecipe("req-001", "R1", "v1", "配方一", []release.Ma
 
 同一版本内物料编号不可重复；已登记的版本内容不可覆盖（`ErrRecipeExists`）。
 
-### 批次状态机
+### 登记投料并查看数量核对（连续流程）
+
+下面这段示例从一个尚未使用的数据位置开始，在同一个批次 `B1` 上按顺序完成
+打开与释放台账、登记配方、创建批次、开始执行、登记投料、查询和关闭。配方只
+登记一个版本 `R1/v1` 并全程使用它，计划份数固定为正整数 4；配方含两种物料：
+`M1` 分两次投料，`M2` 暂不投料。每次写入使用不同的请求编号；所有调用都处理
+返回错误。整段代码可直接运行，不需要读者补齐上下文。
 
 ```go
-batch, err := s.CreateBatch("req-002", "B1", "R1", "v1", 10) // 草稿，份数为正整数
-batch, err = s.UpdateDraftBatch("req-003", "B1", "", "", 20) // 草稿可改份数/配方
-batch, err = s.StartBatch("req-004", "B1")                    // 草稿 → 执行中
-batch, err = s.CloseBatch("req-005", "B1")                   // 执行中 → 已关闭
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/bengzyyys/batch-release/release"
+)
+
+func main() {
+	// 从一个尚未使用的数据位置开始：目录不存在会自动创建，空目录得到空台账。
+	// 实际使用时把这里换成固定路径即可；重新打开同一位置，数据仍完整可查。
+	dataDir, err := os.MkdirTemp("", "ledger-walkthrough-")
+	if err != nil {
+		log.Fatalf("准备数据位置失败: %v", err)
+	}
+	store, err := release.Open(dataDir)
+	if err != nil {
+		log.Fatalf("打开台账失败: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil { // 释放台账占用的文件锁
+			log.Fatalf("释放台账失败: %v", err)
+		}
+	}()
+
+	// 1. 登记配方版本 R1/v1：每一份用 M1 50 克、M2 12.5 克。
+	recipe, err := store.RegisterRecipe("req-001", "R1", "v1", "混合配方", []release.MaterialInput{
+		{MaterialNo: "M1", Grams: "50"},
+		{MaterialNo: "M2", Grams: "12.5"},
+	})
+	if err != nil {
+		log.Fatalf("登记配方失败: %v", err)
+	}
+	fmt.Printf("已登记配方 %s/%s（%s），物料 %d 种\n", recipe.RecipeNo, recipe.Version, recipe.Name, len(recipe.Materials))
+
+	// 2. 用同一配方版本创建批次 B1，固定的正整数计划份数：4 份。新批次为草稿。
+	batch, err := store.CreateBatch("req-002", "B1", "R1", "v1", 4)
+	if err != nil {
+		log.Fatalf("创建批次失败: %v", err)
+	}
+	fmt.Printf("批次 %s 已创建，状态=%s，计划份数=%d\n", batch.BatchNo, batch.Status, batch.PlannedPortions)
+
+	// 3. 开始执行：草稿 → 执行中。投料必须发生在这一步之后。
+	batch, err = store.StartBatch("req-003", "B1")
+	if err != nil {
+		log.Fatalf("开始执行失败: %v", err)
+	}
+	fmt.Printf("批次 %s 状态=%s\n", batch.BatchNo, batch.Status)
+
+	// 4. 登记投料：物料 M1 分两次投，M2 暂不投料。
+	//    每次写入使用不同的请求编号；克数、投料时间和登记人都明确给出。
+	t1 := time.Date(2026, 10, 7, 9, 30, 0, 0, time.UTC)
+	feeding1, err := store.AddFeeding("req-004", "B1", "M1", "120", t1, "张三")
+	if err != nil {
+		log.Fatalf("第一次登记投料失败: %v", err)
+	}
+	fmt.Printf("投料 #%d：%s %s 克，%s 登记\n", feeding1.Seq, feeding1.MaterialNo, feeding1.Grams, feeding1.Registrar)
+
+	t2 := time.Date(2026, 10, 7, 10, 15, 30, 0, time.UTC)
+	feeding2, err := store.AddFeeding("req-005", "B1", "M1", "80.250", t2, "李四")
+	if err != nil {
+		log.Fatalf("第二次登记投料失败: %v", err)
+	}
+	// 台账按千分之一克定点保存，成功结果去掉末尾多余的 0：提交 80.250 显示 80.25。
+	fmt.Printf("投料 #%d：%s %s 克，%s 登记\n", feeding2.Seq, feeding2.MaterialNo, feeding2.Grams, feeding2.Registrar)
+
+	// 5. 执行中查询：两次登记保留为两条投料，数量按千分之一克精度累计。
+	executing, err := store.GetBatch("B1")
+	if err != nil {
+		log.Fatalf("执行中查询失败: %v", err)
+	}
+	printBatch("执行中查询结果：", executing)
+
+	// 6. 关闭批次：执行中 → 已关闭。关闭只确认已有投料：即使 M2 完全未投、
+	//    数量并不吻合也允许关闭。关闭不表示数量通过检查，也不表示已经放行。
+	closed, err := store.CloseBatch("req-006", "B1")
+	if err != nil {
+		log.Fatalf("关闭批次失败: %v", err)
+	}
+	printBatch("关闭返回结果：", closed)
+
+	// 7. 关闭后再次查询：配方版本、计划份数、投料顺序与核对数量都不变，
+	//    只有状态变为已关闭。
+	afterClose, err := store.GetBatch("B1")
+	if err != nil {
+		log.Fatalf("关闭后查询失败: %v", err)
+	}
+	printBatch("关闭后查询结果：", afterClose)
+
+	// 错误用法一：草稿状态登记投料。B2 刚创建仍是草稿，投料返回 ErrInvalidState，
+	// 不增加投料。
+	if _, err := store.CreateBatch("req-007", "B2", "R1", "v1", 4); err != nil {
+		log.Fatalf("创建批次 B2 失败: %v", err)
+	}
+	if _, err := store.AddFeeding("req-008", "B2", "M1", "10", t1, "张三"); !errors.Is(err, release.ErrInvalidState) {
+		log.Fatalf("草稿状态投料应返回 ErrInvalidState，得到 %v", err)
+	}
+	b2, err := store.GetBatch("B2")
+	if err != nil {
+		log.Fatalf("查询 B2 失败: %v", err)
+	}
+	fmt.Printf("草稿投料被拒绝：B2 投料条数=%d（未增加投料）\n", len(b2.Feedings))
+
+	// 错误用法二：关闭后用新请求编号追加投料。返回 ErrInvalidState，不增加投料。
+	if _, err := store.AddFeeding("req-009", "B1", "M2", "50", t2, "王五"); !errors.Is(err, release.ErrInvalidState) {
+		log.Fatalf("关闭后追加投料应返回 ErrInvalidState，得到 %v", err)
+	}
+	b1Again, err := store.GetBatch("B1")
+	if err != nil {
+		log.Fatalf("关闭后查询 B1 失败: %v", err)
+	}
+	fmt.Printf("关闭后追加被拒绝：B1 投料条数=%d（未增加投料）\n", len(b1Again.Feedings))
+
+	// 关闭后用原请求编号、原样重复提交已成功的投料请求：返回第一次登记的那条
+	// 记录（这里是 #2）。这是取回原记录，不是允许新增投料。
+	replay, err := store.AddFeeding("req-005", "B1", "M1", "80.250", t2, "李四")
+	if err != nil {
+		log.Fatalf("原样重放已成功的投料请求应返回首次结果: %v", err)
+	}
+	fmt.Printf("原样重放取回投料 #%d：%s %s 克，%s 登记\n", replay.Seq, replay.MaterialNo, replay.Grams, replay.Registrar)
+	finalView, err := store.GetBatch("B1")
+	if err != nil {
+		log.Fatalf("最终查询 B1 失败: %v", err)
+	}
+	fmt.Printf("重放后 B1 投料条数=%d（取回原记录，不新增投料）\n", len(finalView.Feedings))
+}
+
+// printBatch 打印批次状态、全部投料与逐物料数量核对。
+func printBatch(title string, b *release.BatchView) {
+	fmt.Println(title)
+	fmt.Printf("  批次=%s 配方=%s/%s（%s） 计划份数=%d 状态=%s\n",
+		b.BatchNo, b.RecipeNo, b.RecipeVersion, b.RecipeName, b.PlannedPortions, b.Status)
+	fmt.Println("  投料登记（按登记顺序）：")
+	for _, f := range b.Feedings {
+		fmt.Printf("    #%d %s %s 克 投料时间=%s 登记人=%s\n",
+			f.Seq, f.MaterialNo, f.Grams, f.Time.Format(time.RFC3339), f.Registrar)
+	}
+	fmt.Println("  数量核对（应投量 / 累计实投量 / 差额=实投-应投，单位克）：")
+	for _, m := range b.Materials {
+		fmt.Printf("    %s: %s / %s / %s\n", m.MaterialNo, m.RequiredGrams, m.ActualGrams, m.DifferenceGrams)
+	}
+}
 ```
 
-开始执行后计划份数与配方版本固定；只有执行中的批次可以关闭，
-关闭表示确认已有投料，不要求数量吻合；关闭后不能追加投料或重新打开。
+#### 执行中的查询结果
 
-### 投料
+两次投料之后、关闭之前，`GetBatch("B1")` 返回状态 `executing`、配方 `R1/v1`、
+计划份数 4，投料按成功登记的先后保留为两条（投料时间不参与排序）：
 
-执行中可以分多次追加投料，物料必须属于该批次绑定的配方版本：
+| 序号 | 物料 | 本次克数 | 投料时间 | 登记人 |
+| --- | --- | --- | --- | --- |
+| 1 | M1 | 120 | 2026-10-07T09:30:00Z | 张三 |
+| 2 | M1 | 80.25 | 2026-10-07T10:15:30Z | 李四 |
+
+逐物料数量核对（应投量 = 每份克数 × 4；差额 = 累计实投 − 应投）：
+
+| 物料 | 应投量（克） | 累计实投量（克） | 差额（克） |
+| --- | --- | --- | --- |
+| M1 | 200（50×4） | 200.25（120 + 80.250） | 0.25 |
+| M2 | 50（12.5×4） | 0（暂不投料） | -50 |
+
+没有投料的 `M2` 仍然出现：实投量为零，差额为应投量的负值 -50；`M1` 的两次
+登记始终保留为两条投料，不做合并。数量按千分之一克精度定点累计：提交的
+`80.250` 与结果中显示的 `80.25` 是同一数量，120 + 80.250 精确累计为 200.25。
+
+#### 关闭后的查询结果
+
+关闭后再查 `B1`，配方版本（`R1/v1`）、计划份数（4）、投料顺序与上面的核对
+数量全部保持一致，只有状态从 `executing` 变为 `closed`：两条投料仍是 #1、#2，
+`M1` 仍是 200 / 200.25 / 0.25，`M2` 仍是 50 / 0 / -50。
+
+关闭的含义是**确认批次上已有的投料记录**：即使本例中 `M2` 完全未投、整体
+数量并不吻合，执行中的批次也允许关闭。关闭不是“数量通过检查”，也不代表
+“已经放行”；关闭后不能追加投料，也不能重新打开。
+
+#### 投料时机的两个错误用法
+
+投料只允许发生在开始执行之后、关闭之前。下面两种写法都返回
+`release.ErrInvalidState`（可用 `errors.Is` 判断），且都不增加投料：
 
 ```go
-feeding, err := s.AddFeeding("req-006", "B1", "M1", "100.5", time.Now(), "张三")
+// 1) 草稿状态登记投料：B2 尚未开始执行，返回 ErrInvalidState，B2 仍无投料。
+_, err = store.AddFeeding("req-008", "B2", "M1", "10", t1, "张三")
+fmt.Println(errors.Is(err, release.ErrInvalidState)) // true
+
+// 2) 关闭后用新请求编号追加投料：B1 已关闭，返回 ErrInvalidState，仍是两条投料。
+_, err = store.AddFeeding("req-009", "B1", "M2", "50", t2, "王五")
+fmt.Println(errors.Is(err, release.ErrInvalidState)) // true
 ```
+
+失败的提交不占用请求编号，也不改变批次状态。另外，关闭后用**原请求编号、
+原样**重复提交此前已成功的投料请求（示例中的 `req-005`，物料、克数原文、
+投料时间与登记人完全一致），仍会返回第一次登记的结果（序号 2 的那条
+80.25 克记录）：这是按幂等规则**取回原记录**，不是允许在关闭后新增投料，
+批次中的投料条数与累计实投量都不因重放而变化。
+
+### 批次状态机与草稿调整
+
+批次生命周期为 草稿（`draft`）→ 执行中（`executing`）→ 已关闭（`closed`）。
+上一节已在 `B1` 上演示创建、开始执行、投料与关闭的完整连续流程；草稿阶段
+独有的“调整份数 / 改选配方版本”在下面这个独立片段中用另一个批次 `B3` 演示
+（同样需要先登记配方并打开台账，这里省略与上节相同的准备代码）：
+
+```go
+batch, err := s.CreateBatch("req-101", "B3", "R1", "v1", 10) // 草稿，份数为正整数
+if err != nil {
+	log.Fatal(err)
+}
+batch, err = s.UpdateDraftBatch("req-102", "B3", "", "", 20) // 草稿可改份数/配方
+if err != nil {
+	log.Fatal(err)
+}
+batch, err = s.StartBatch("req-103", "B3") // 草稿 → 执行中
+if err != nil {
+	log.Fatal(err)
+}
+batch, err = s.CloseBatch("req-104", "B3") // 执行中 → 已关闭
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+`UpdateDraftBatch` 的新配方编号与版本号同时留空表示不改配方，新份数传 0
+表示不改份数；非草稿状态调整返回 `ErrInvalidState`。开始执行后计划份数与
+配方版本固定；只有执行中的批次可以登记投料与关闭，关闭确认已有投料、不要求
+数量吻合；关闭后不能追加投料或重新打开（投料的完整连续示例见上一节）。
 
 投料按成功登记的先后顺序编号，不按投料时间重排；同一批次不同物料共用这一
 序列、从 1 连续编号，不同批次各自从 1 开始。即使两条投料时间相同，或后一条
@@ -200,13 +422,15 @@ recipe, err := s.GetRecipe("R1", "v1")
 并按物料逐项列出应投量（每份克数 × 计划份数）、累计实投量和实投减应投的差额；
 没有投料的物料也会显示，超投不会抵消其他物料的欠投。
 返回的视图是台账数据的副本，调用方修改不会影响台账。
+执行中与关闭后查询的完整字段示例见上一节“登记投料并查看数量核对”。
 
 ### 请求编号与幂等
 
 每次写入都带请求编号（第一个参数）。同一位置内：
 
 - 相同编号 + 相同操作内容重复提交，返回第一次成功的结果，不新增批次或重复投料
-  （即使批次已经关闭）；
+  （即使批次已经关闭；上一节已演示关闭后原样重放 `req-005` 只取回首次登记的
+  投料记录，不增加投料）；
 - 相同编号用于其他操作或不同内容，返回 `release.ErrRequestConflict`；
 - 失败不占用编号，也不留下部分记录或状态变化。
 
