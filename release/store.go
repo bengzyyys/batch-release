@@ -1,6 +1,7 @@
 package release
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,11 @@ type Store struct {
 // Open 打开（或首次使用）位于 dir 的台账。
 // 目录不存在时会创建；目录中没有台账文件时得到空台账；
 // 台账文件已存在但没有任何内容（零字节，无论原本就是空文件还是使用中被截断）
-// 时按损坏处理；已有台账文件无法读取、解析，存在两条配方编号与版本号
+// 时按损坏处理；已有台账文件无法读取、解析，台账 JSON 的 requests 对象中
+// 同一请求编号出现两次或更多次（按 JSON 字符串解码后的实际编号判断，转义
+// 写法与直接写法表示同一字符的算同一个编号；无论多份记录的操作、提交内容
+// 与返回结果完全相同，还是内容不同、对应不同批次或不同写入操作，都不能挑
+// 一份继续使用、合并或删除重复项），存在两条配方编号与版本号
 // 完全相同的配方记录，存在两条批次编号完全相同的批次记录，
 // 任一已保存配方版本不包含任何物料（物料列表为空数组、null 或字段缺失，
 // 即使名称、编号、版本号齐全且内容能正常解析；含尚未被任何批次引用的版本），
@@ -197,6 +202,11 @@ func (s *Store) load() error {
 		// 空台账补写，也不能凭内存中的旧记录还原，调用方必须明确知道无法读取。
 		return fmt.Errorf("%w: 台账文件 %q 没有内容", ErrCorruptData, filepath.Join(s.dir, stateFileName))
 	}
+	// 请求编号重复必须先于解析判断：Requests 以请求编号为键，重复编号在
+	// 解析成 map 时会被静默丢掉一份，剩下的记录不再完整。
+	if err := checkDuplicateRequestNos(data); err != nil {
+		return err
+	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return fmt.Errorf("%w: 台账文件解析失败: %v", ErrCorruptData, err)
@@ -211,6 +221,67 @@ func (s *Store) load() error {
 		st.Requests = map[string]*requestRecord{}
 	}
 	s.state = &st
+	return nil
+}
+
+// checkDuplicateRequestNos 检查台账 JSON 的 requests 对象中是否存在重复的
+// 请求编号。Requests 以请求编号为键，同一编号出现两份或更多记录时，解析成
+// map 只会留下其中一份，另一份不再进入任何核对——重放该编号返回哪份结果
+// 将取决于文件中的排列顺序。因此只要发现重复编号，整份台账即视为损坏：
+// 不能挑第一份或最后一份继续使用，不能合并记录、删除重复项，也不能重新
+// 计算结果后掩盖冲突；两份记录的操作、提交内容与返回结果完全相同，或内容
+// 不同、对应不同批次、不同写入操作，都一样拒绝。其他配方、批次与请求正常，
+// 或调用方只访问另一批次，都不能绕过。
+//
+// 编号是否重复按 JSON 字符串表示的实际编号判断：键名解码后比较，直接写出
+// 的字符与转义后表示同一字符的写法（如 "req-1" 与把连字符写成 Unicode
+// 转义 "req\u002d1" 的同一编号）算同一个编号。不同编号仍按精确匹配区分，
+// 记录内部（提交内容、返回结果）出现的批次编号、物料编号等同名字段不是
+// 这里的键，不参与本检查。
+//
+// 本函数只读取原始字节，绝不改动文件；台账结构本身无法解析时不在此报错，
+// 留给 load 中后续的 json.Unmarshal 统一按解析失败报告。
+func checkDuplicateRequestNos(data []byte) error {
+	var probe struct {
+		Requests json.RawMessage `json:"requests"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil
+	}
+	raw := probe.Requests
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	// requests 不是对象（数组、标量等）时由后续解析统一报告。
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, ok := kt.(string)
+		if !ok {
+			return nil
+		}
+		if seen[key] {
+			return fmt.Errorf("%w: 请求编号 %q 在台账中存在多份同编号请求记录",
+				ErrCorruptData, key)
+		}
+		seen[key] = true
+		// 跳过该编号下的整份请求记录，只关心键是否重复。
+		var skipped json.RawMessage
+		if err := dec.Decode(&skipped); err != nil {
+			return nil
+		}
+	}
 	return nil
 }
 
